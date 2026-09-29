@@ -197,6 +197,12 @@ enum MainMenuBuilder {
         }
         sizeItem.submenu = sizeMenu
         subMenu.addItem(sizeItem)
+        let fontItem = NSMenuItem(title: L("menu.subtitleFont"), action: nil, keyEquivalent: "")
+        let fontMenu = NSMenu(title: L("menu.subtitleFont"))
+        fontMenu.identifier = NSUserInterfaceItemIdentifier(SubtitleFontMenu.identifier)
+        fontMenu.delegate = trackMenuDelegate
+        fontItem.submenu = fontMenu
+        subMenu.addItem(fontItem)
 
         if #available(macOS 26.0, *), SPPlayerCore.fullFeatureTier() {
             subMenu.addItem(.separator())

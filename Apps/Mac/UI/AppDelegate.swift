@@ -414,6 +414,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SPTimelineStyleSettings.style = style
     }
 
+    @objc func subtitleFontAction(_ sender: NSMenuItem) {
+        SubtitleFontSettings.family = sender.representedObject as? String
+    }
+
     @objc func languageAction(_ sender: NSMenuItem) {
         let target = sender.representedObject as? String
         guard target != AppLanguage.current else { return }
@@ -661,7 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     if ProcessInfo.processInfo.environment["SP_MENUTEST"] != nil {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [menuRouter] in
-            for id in ["sp.audioTracks", "sp.subtitleTracks", "sp.subtitleScale",
+            for id in ["sp.audioTracks", "sp.subtitleTracks", "sp.subtitleScale", "sp.subtitleFont",
                        "sp.recentPlays", "sp.language", "sp.appMenu",
                        "sp.frameInterpolation", "sp.aspectMenu", "sp.cropMenu",
                        "sp.turbo", "sp.timelineStyle"] {

@@ -11,6 +11,9 @@
 
 - (void)setCodecPrivate:(NSData *)priv;
 
+// authoredStyles=NO marks an app-owned header whose styles follow the selected font.
+- (void)setCodecPrivate:(NSData *)priv authoredStyles:(BOOL)authored;
+
 - (void)loadSubtitleText:(NSString *)text completion:(void (^)(BOOL ok))completion;
 
 - (void)invalidatePendingLoads;
@@ -22,6 +25,14 @@
 - (void)resetTrack;
 
 - (void)setFontScale:(double)scale;
+
+// Font family for app-styled text tracks; nil or empty keeps the style's font.
+- (void)setFontFamily:(NSString *)family;
+
+// Style font and plain text of the events nearest the last rendered time, for
+// resolving which fonts the default style draws with. Both are nil for authored
+// ASS styles or an empty track. The completion runs on the subtitle queue.
+- (void)fetchDefaultFontSample:(void (^)(NSString *styleFont, NSString *sampleText))completion;
 
 @property (nonatomic, readonly) BOOL hasSubtitles;
 

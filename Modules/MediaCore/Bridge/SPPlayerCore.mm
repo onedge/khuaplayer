@@ -630,6 +630,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     std::atomic<int64_t> _subLoadGen;
     NSInteger _currentSubtitleTrackPub;
     double _subtitleScale;
+    NSString *_subtitleFontFamily;
     NSString *_hdrDescription;
     NSString *_hdrStaticDetail;
     NSString *_hdrCodecName;
@@ -4823,6 +4824,7 @@ static NSString *spLangDisplayName(const std::string &lang) {
             body, [_renderer outputModeDescription]];
 }
 - (double)subtitleScale { return _subtitleScale; }
+- (NSString *)subtitleFontFamily { return _subtitleFontFamily; }
 
 - (void)handleAudioOutputLayoutChange {
     if (!_audioOutput || ![_audioOutput outputLayoutChangePending]) return;
@@ -5277,6 +5279,27 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     if (spDebug()) SPLOG(@"[Track] 字幕大小=%.2f", s);
 }
 
+- (void)setSubtitleFontFamily:(NSString *)family {
+    NSString *f = family.length ? [family copy] : nil;
+    if (f == _subtitleFontFamily || [f isEqualToString:_subtitleFontFamily]) return;
+    _subtitleFontFamily = f;
+    [_subtitleRenderer setFontFamily:f];
+    [self refreshSubtitleDisplay];
+    if (spDebug()) SPLOG(@"[Track] 字幕字体=%@", f ?: @"默认");
+}
+
+- (void)requestSubtitleFontSample:(void (^)(NSString *, NSString *))completion {
+    if (!completion) return;
+    SPSubtitleRenderer *renderer = _subtitleRenderer;
+    if (!renderer || !renderer.hasSubtitles) {
+        completion(nil, nil);
+        return;
+    }
+    [renderer fetchDefaultFontSample:^(NSString *styleFont, NSString *sampleText) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(styleFont, sampleText); });
+    }];
+}
+
 #pragma mark - Generated subtitles
 
 - (void)beginGeneratedSubtitleTrackWithHeader:(NSString *)assHeader {
@@ -5291,7 +5314,8 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     [_subtitleRenderer invalidatePendingLoads];
     [_subtitleRenderer resetTrack];
     if (assHeader.length > 0) {
-        [_subtitleRenderer setCodecPrivate:[assHeader dataUsingEncoding:NSUTF8StringEncoding]];
+        [_subtitleRenderer setCodecPrivate:[assHeader dataUsingEncoding:NSUTF8StringEncoding]
+                            authoredStyles:NO];
     }
     _renderer.subtitleTexture = nil;
     _generatedSubtitleActive.store(true);

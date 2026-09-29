@@ -4,6 +4,11 @@ All notable public releases will be documented here.
 
 ## Unreleased
 
+- Added a Subtitle Font menu for SRT, WebVTT, mov_text and generated
+  subtitles. The choice is remembered across launches, while styled ASS
+  subtitles and positioned text keep their authored fonts. The Default item
+  names the fonts the current subtitles are drawn with.
+
 ## 0.6.1
 
 - Reused existing update checks for installation-level activity and version

@@ -336,6 +336,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let t0 = CFAbsoluteTimeGetCurrent()
         let c = SPPlayerCore(view: playerView)
         c.delegate = self
+        c.setSubtitleFontFamily(SubtitleFontSettings.family)
 
         core = c
 
@@ -503,6 +504,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             object: nil, queue: .main
         ) { [weak self] _ in
             self?.core?.displayScreenChanged()
+        })
+
+        observerTokens.append(NotificationCenter.default.addObserver(
+            forName: SubtitleFontSettings.changed, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.core?.setSubtitleFontFamily(SubtitleFontSettings.family)
         })
 
         observerTokens.append(NotificationCenter.default.addObserver(
@@ -3195,6 +3202,18 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 return
             }
             self.loadExternalSubtitle(url: url)
+        }
+    }
+
+    /// Default style font and nearby subtitle text; both nil without app-styled subtitles.
+    func requestSubtitleFontSample(_ completion: @escaping @MainActor (String?, String?) -> Void) {
+        guard let core else {
+            completion(nil, nil)
+            return
+        }
+        // SPPlayerCore invokes the completion on the main queue.
+        core.requestSubtitleFontSample { styleFont, sample in
+            MainActor.assumeIsolated { completion(styleFont, sample) }
         }
     }
 

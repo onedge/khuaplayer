@@ -9,6 +9,7 @@
 #include <cmath>
 #include <mach/mach_time.h>
 #include <os/lock.h>
+#include <string>
 #include <vector>
 
 #import <Foundation/Foundation.h>
@@ -80,6 +81,9 @@ struct AssApi {
     void (*set_margins)(ASS_Renderer *, int, int, int, int);
     void (*set_font_scale)(ASS_Renderer *, double);
     void (*set_cache_limits)(ASS_Renderer *, int, int);
+    // Optional: a missing font override disables font selection, not subtitles.
+    void (*set_selective_style_override_enabled)(ASS_Renderer *, int);
+    void (*set_selective_style_override)(ASS_Renderer *, ASS_Style *);
     bool ok = false;
 };
 
@@ -110,6 +114,8 @@ AssApi &assApi() {
         SP_LOAD(set_frame_size); SP_LOAD(set_storage_size);
         SP_LOAD(set_fonts); SP_LOAD(set_hinting); SP_LOAD(set_margins);
         SP_LOAD(set_font_scale); SP_LOAD(set_cache_limits);
+        SP_LOAD(set_selective_style_override_enabled);
+        SP_LOAD(set_selective_style_override);
 #undef SP_LOAD
         api.ok = api.library_init && api.library_done && api.renderer_init &&
                  api.renderer_done && api.new_track && api.free_track &&
@@ -154,7 +160,10 @@ AssApi &assApi() {
     int _scanCacheOverlap;
     double _scanCachePx;
     double _fontScale;
+    std::string _fontFamily;
     NSData *_codecPrivate;
+    BOOL _codecPrivateHasAuthoredStyles;
+    BOOL _trackHasAuthoredStyles;
     BOOL _overlapWarned;
 
     BOOL _externalTrackActive;
@@ -205,6 +214,8 @@ AssApi &assApi() {
         _renderCostEMAms = 0.0;
         _scanCacheValid = false;
         _codecPrivate = nil;
+        _codecPrivateHasAuthoredStyles = NO;
+        _trackHasAuthoredStyles = NO;
         _fontScale = 1.0;
         _overlapWarned = NO;
         _pubLock = OS_UNFAIR_LOCK_INIT;
@@ -334,6 +345,7 @@ static const char *kAssHeader =
     } else {
         A.process_codec_private(_track, (char *)kAssHeader, (int)strlen(kAssHeader));
     }
+    _trackHasAuthoredStyles = _codecPrivate.length > 0 && _codecPrivateHasAuthoredStyles;
 
     A.set_frame_size(_renderer, _lastW > 0 ? _lastW : 1280, _lastH > 0 ? _lastH : 720);
     A.set_storage_size(_renderer, _lastW > 0 ? _lastW : 1280, _lastH > 0 ? _lastH : 720);
@@ -341,9 +353,38 @@ static const char *kAssHeader =
     A.set_hinting(_renderer, ASS_HINTING_LIGHT);
     A.set_margins(_renderer, 0, 0, 0, 0);
     A.set_font_scale(_renderer, _fontScale > 0 ? _fontScale : 1.0);
+    [self workerApplyFontOverride];
 
     A.set_cache_limits(_renderer, 2000, 32);
     return YES;
+}
+
+// libass initializes renderers with SELECTIVE_FONT_SCALE, so font scale skips
+// positioned events. Font selection adds FONT_NAME to that baseline rather than
+// replacing it. libass never applies FONT_NAME to positioned (\pos, \move)
+// events, and tracks with authored ASS styles keep their own fonts.
+static const int kBaseStyleOverrideBits = ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE;
+
+- (void)workerApplyFontOverride {
+    if (!_renderer) return;
+    AssApi &A = assApi();
+    if (!A.set_selective_style_override_enabled || !A.set_selective_style_override) return;
+    const bool apply = !_fontFamily.empty() && !_trackHasAuthoredStyles;
+    if (apply) {
+        // libass copies FontName; the other fields are unused under FONT_NAME alone.
+        ASS_Style style = {};
+        style.FontName = (char *)_fontFamily.c_str();
+        A.set_selective_style_override(_renderer, &style);
+    }
+    A.set_selective_style_override_enabled(
+        _renderer, apply ? (kBaseStyleOverrideBits | ASS_OVERRIDE_BIT_FONT_NAME)
+                         : kBaseStyleOverrideBits);
+}
+
+- (void)workerSetTrackHasAuthoredStyles:(BOOL)authored {
+    if (_trackHasAuthoredStyles == authored) return;
+    _trackHasAuthoredStyles = authored;
+    [self workerApplyFontOverride];
 }
 
 - (void)workerFreeAss {
@@ -364,11 +405,13 @@ static const char *kAssHeader =
     A.free_track(_track);
     _track = A.new_track(_lib);
     if (!_track) return;
-    if (!useDefault && _codecPrivate.length) {
+    const BOOL useCodecPrivate = !useDefault && _codecPrivate.length > 0;
+    if (useCodecPrivate) {
         A.process_codec_private(_track, (char *)_codecPrivate.bytes, (int)_codecPrivate.length);
     } else {
         A.process_codec_private(_track, (char *)kAssHeader, (int)strlen(kAssHeader));
     }
+    [self workerSetTrackHasAuthoredStyles:useCodecPrivate && _codecPrivateHasAuthoredStyles];
 }
 
 - (void)poisonForGen:(uint64_t)gen reason:(NSString *)reason {
@@ -747,6 +790,7 @@ static const char *kAssHeader =
     os_unfair_lock_unlock(&_pubLock);
     dispatch_async(_assQueue, ^{
         self->_codecPrivate = nil;
+        self->_codecPrivateHasAuthoredStyles = NO;
         self->_externalTrackActive = NO;
         self->_overlapWarned = NO;
         self->_texture = nil;
@@ -760,9 +804,14 @@ static const char *kAssHeader =
 }
 
 - (void)setCodecPrivate:(NSData *)priv {
+    [self setCodecPrivate:priv authoredStyles:YES];
+}
+
+- (void)setCodecPrivate:(NSData *)priv authoredStyles:(BOOL)authored {
     NSData *copied = priv.length ? [priv copy] : nil;
     dispatch_async(_assQueue, ^{
         self->_codecPrivate = copied;
+        self->_codecPrivateHasAuthoredStyles = authored;
         [self workerRebuildTrackWithDefaultHeader:NO];
     });
 }
@@ -774,6 +823,86 @@ static const char *kAssHeader =
             assApi().set_font_scale(self->_renderer, scale);
             [self workerResetDynamicState];
         }
+    });
+}
+
+- (void)setFontFamily:(NSString *)family {
+    std::string name = family.length ? std::string(family.UTF8String) : std::string();
+    dispatch_async(_assQueue, ^{
+        if (self->_fontFamily == name) return;
+        self->_fontFamily = name;
+        if (self->_renderer) {
+            [self workerApplyFontOverride];
+            [self workerResetDynamicState];
+        }
+    });
+}
+
+// Enough nearby events to cover the scripts on screen without scanning text
+// across the whole track.
+static const int kFontSampleEventLimit = 24;
+static const NSUInteger kFontSampleMaxLength = 1200;
+
+// Drop override blocks and ASS escapes so only displayed characters remain.
+static NSString *spPlainEventText(const char *text) {
+    NSString *raw = text ? [NSString stringWithUTF8String:text] : nil;
+    if (!raw.length) return nil;
+    NSMutableString *plain = [NSMutableString stringWithCapacity:raw.length];
+    NSUInteger depth = 0;
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+        if (c == '{') { depth++; continue; }
+        if (c == '}' && depth > 0) { depth--; continue; }
+        if (depth > 0) continue;
+        if (c == '\\' && i + 1 < raw.length) {
+            unichar n = [raw characterAtIndex:i + 1];
+            if (n == 'N' || n == 'n' || n == 'h') { [plain appendString:@" "]; i++; continue; }
+            // Converted SRT escapes literal braces; libass draws them as text.
+            if (n == '{' || n == '}') {
+                if (depth == 0) [plain appendFormat:@"%C", n];
+                i++;
+                continue;
+            }
+        }
+        [plain appendFormat:@"%C", c];
+    }
+    return plain;
+}
+
+- (void)fetchDefaultFontSample:(void (^)(NSString *, NSString *))completion {
+    if (!completion) return;
+    dispatch_async(_assQueue, ^{
+        ASS_Track *track = self->_track;
+        if (!track || track->n_events <= 0 || self->_trackHasAuthoredStyles) {
+            completion(nil, nil);
+            return;
+        }
+        const long long nowMs = self->_desiredUs.load() / 1000;
+        std::vector<int> nearest;
+        nearest.reserve((size_t)track->n_events);
+        for (int i = 0; i < track->n_events; i++) nearest.push_back(i);
+        const size_t keep = std::min(nearest.size(), (size_t)kFontSampleEventLimit);
+        auto distance = [&](int i) { return std::llabs(track->events[i].Start - nowMs); };
+        std::partial_sort(nearest.begin(), nearest.begin() + keep, nearest.end(),
+                          [&](int a, int b) { return distance(a) < distance(b); });
+
+        NSString *styleFont = nil;
+        NSMutableString *sample = [NSMutableString string];
+        for (size_t k = 0; k < keep && sample.length < kFontSampleMaxLength; k++) {
+            const ASS_Event &event = track->events[nearest[k]];
+            if (!styleFont && event.Style >= 0 && event.Style < track->n_styles &&
+                track->styles[event.Style].FontName) {
+                styleFont = [NSString stringWithUTF8String:track->styles[event.Style].FontName];
+            }
+            NSString *plain = spPlainEventText(event.Text);
+            if (plain.length) [sample appendFormat:@"%@ ", plain];
+        }
+        if (sample.length > kFontSampleMaxLength) {
+            NSRange cut = [sample rangeOfComposedCharacterSequencesForRange:
+                                      NSMakeRange(0, kFontSampleMaxLength)];
+            [sample deleteCharactersInRange:NSMakeRange(NSMaxRange(cut), sample.length - NSMaxRange(cut))];
+        }
+        completion(styleFont, sample.length ? [sample copy] : nil);
     });
 }
 
@@ -937,6 +1066,7 @@ static NSString *sanitizeSubtitleLines(NSString *text, unsigned logId) {
         ASS_Track *old = self->_track;
         self->_track = tmp;
         self->_externalTrackActive = YES;
+        [self workerSetTrackHasAuthoredStyles:isASS];
         self->_hasSubtitles.store(true);
         A.free_track(old);
         [self workerResetDynamicState];

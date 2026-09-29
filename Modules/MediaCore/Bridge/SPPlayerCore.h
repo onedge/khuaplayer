@@ -211,6 +211,15 @@ NS_SWIFT_UI_ACTOR
 // Subtitle scale persists across media; 1.0 is the authored size, clamped to 0.25...3.0.
 - (void)setSubtitleScale:(double)scale;
 @property (nonatomic, readonly) double subtitleScale;
+// Font family for SRT, WebVTT, mov_text and generated tracks; authored ASS styles
+// keep their fonts. nil restores the default style font.
+- (void)setSubtitleFontFamily:(nullable NSString *)family;
+@property (nonatomic, readonly, copy, nullable) NSString *subtitleFontFamily;
+// Style font and displayed text near the playhead for app-styled tracks, used to
+// name the fonts the default style resolves to. Both nil for authored ASS styles
+// or no subtitles. The completion runs on the main queue.
+- (void)requestSubtitleFontSample:(void (^)(NSString *_Nullable styleFont,
+                                            NSString *_Nullable sampleText))completion;
 
 // Begin a generated virtual track by stopping embedded packets, clearing the
 // renderer and loading the supplied ASS header. The container track index is -1;

@@ -54,6 +54,11 @@ final class MenuRouter: NSObject, NSMenuDelegate {
             for item in menu.items where !item.isSeparatorItem {
                 item.state = item.tag == cur ? .on : .off
             }
+        case SubtitleFontMenu.identifier:
+            SubtitleFontMenu.populate(menu,
+                                      requestSample: Self.activePlayerVC()?.requestSubtitleFontSample)
+        case SubtitleFontMenu.allFontsIdentifier:
+            SubtitleFontMenu.populateAllFonts(menu)
         case "sp.language":
             let current = AppLanguage.current
             for item in menu.items where !item.isSeparatorItem {
