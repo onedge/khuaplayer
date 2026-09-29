@@ -32,7 +32,21 @@ constant int fcOutputMode [[function_constant(6)]];
 constant int fcSourceGamut [[function_constant(7)]];
 constant int fcPlanar     [[function_constant(8)]];
 constant int fcSdrBoost   [[function_constant(9)]];
-constant bool kSpec = is_function_constant_defined(fcPrimaries);
+// Metal API validation treats a function constant as required unless its own
+// is_function_constant_defined guards it, so the generic pipeline (no values)
+// fails under Xcode's default validation when only fcPrimaries is checked.
+// Specialized pipelines always set all ten constants together.
+constant bool kSpec =
+    is_function_constant_defined(fcPrimaries) &&
+    is_function_constant_defined(fcTransfer) &&
+    is_function_constant_defined(fcBits) &&
+    is_function_constant_defined(fcRange) &&
+    is_function_constant_defined(fcHdr) &&
+    is_function_constant_defined(fcDovi) &&
+    is_function_constant_defined(fcOutputMode) &&
+    is_function_constant_defined(fcSourceGamut) &&
+    is_function_constant_defined(fcPlanar) &&
+    is_function_constant_defined(fcSdrBoost);
 
 #pragma mark - Full-screen triangle
 

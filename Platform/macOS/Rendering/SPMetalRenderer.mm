@@ -954,6 +954,10 @@ static bool spRenderInlineMode(void) {
         id<MTLCommandQueue> q = [_device newCommandQueue];
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
                                                                                      width:8 height:8 mipmapped:NO];
+        // The default usage is ShaderRead; Metal API validation aborts on a
+        // color attachment without RenderTarget.
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
         id<MTLTexture> target = [_device newTextureWithDescriptor:td];
         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
         rpd.colorAttachments[0].texture = target;
