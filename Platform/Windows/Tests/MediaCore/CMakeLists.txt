@@ -27,6 +27,7 @@ set(KHUA_PORTABLE_HEADERS
     Core/Platform/SPThread.hpp
     Core/Platform/SPWin32.hpp
     Core/Player/SPExecutor.hpp
+    Core/Player/SPPlayerListener.hpp
     Core/Player/SPSync.hpp
     Core/Player/SPTasks.hpp
     Core/Player/SPVideoFrame.hpp

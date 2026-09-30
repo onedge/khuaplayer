@@ -5,6 +5,7 @@
 #include "Player/SPTasks.hpp"
 #define SP_VIDEO_FRAME_CV_BRIDGE 1
 #include "Player/SPVideoFrame.hpp"
+#import "SPDelegateListener.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -219,6 +220,12 @@ static int spAv1TrialDecodeKeyTU(const uint8_t *data, size_t size) {
 }
 
 static std::atomic<unsigned> gSPCoreLogSeq{0};
+
+// UTF-8 for sp::PlayerError fields; nil or unconvertible strings become empty.
+static std::string spUTF8(NSString *string) {
+    const char *utf8 = string.UTF8String;
+    return utf8 ? std::string(utf8) : std::string();
+}
 #define SPLOG(fmt, ...) NSLog(@"[c%u]" fmt, self->_spLogId, ##__VA_ARGS__)
 
 #define SP_RESLOG(...) do { if (spDebug()) [self resilientLog:[NSString stringWithFormat:__VA_ARGS__]]; } while (0)
@@ -584,6 +591,8 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     CAMetalLayer *_layer;
     SPMetalRenderer *_renderer;
     id<SPVideoDecoding> _decoder;
+    // Delegate events go through here; see SPDelegateListener.h.
+    std::unique_ptr<sp::PlayerListener> _listener;
     // _decoder is replaced on the decode thread. Main-thread code reads the
     // backend from here instead of messaging _decoder, which could be released
     // concurrently. Zero, like a message to nil, means FFmpeg software.
@@ -1247,6 +1256,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 - (instancetype)initWithView:(NSView *)view previewMode:(BOOL)previewMode {
     self = [super init];
     if (self) {
+        _listener = SPMakeDelegateListener(self);
         _previewMode = previewMode;
         _rendererConfiguredOpenGeneration.store(-1);
         _seekSettleGen.store(0);
@@ -2788,11 +2798,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         }
 
         SPLOG(@"[Core] 打开失败 err=%d（%@）path=%@", prepErr, desc, path.lastPathComponent);
-        if ([_delegate respondsToSelector:@selector(playerCore:didFailWithError:)]) {
-            NSError *err = [self makeErrorWithDomain:@"SPDemuxerError" code:prepErr description:desc
-                                               phase:@"open" diagnosis:diagnosis terminal:YES];
-            [_delegate playerCore:self didFailWithError:err];
-        }
+        _listener->didFail({"SPDemuxerError", prepErr, spUTF8(desc), "open", spUTF8(diagnosis), true});
         [self setState:SPPlayerStateFailed];
         if (_indexWaitPrepState) [self startIndexWaitForPath:path state:_indexWaitPrepState];
         _indexWaitPrepState.reset();
@@ -3549,10 +3555,7 @@ static BOOL spThumbsEnabled(void) {
     void (^onUpdate)(void) = ^{
         SPPlayerCore *s = weakSelf;
         if (!s || s->_openGeneration.load() != gen) return;
-        if ([s->_delegate respondsToSelector:
-                @selector(playerCoreDidUpdateTimelinePreview:)]) {
-            [s->_delegate playerCoreDidUpdateTimelinePreview:s];
-        }
+        s->_listener->didUpdateTimelinePreview();
     };
     _thumbnailer = [[SPTimelineThumbnailer alloc]
             initWithPath:_currentFilePath
@@ -3731,10 +3734,7 @@ static BOOL spThumbsEnabled(void) {
 
 - (void)notifyFrameInterpolationDidChange {
     void (^notify)(void) = ^{
-        id<SPPlayerCoreDelegate> delegate = self.delegate;
-        if ([delegate respondsToSelector:@selector(playerCoreDidChangeFrameInterpolation:)]) {
-            [delegate playerCoreDidChangeFrameInterpolation:self];
-        }
+        self->_listener->didChangeFrameInterpolation();
     };
     if (sp::mainThread().isCurrent()) notify();
     else sp::mainThread().post(notify);
@@ -4023,16 +4023,10 @@ static BOOL spThumbsEnabled(void) {
             if (completion) completion(NO);
             if (self->_subLoadGen.load() != loadGen) return;
             if (silent) return;
-            if ([self->_delegate respondsToSelector:
-                     @selector(playerCore:didFailWithError:)]) {
-                NSString *msg = [NSString stringWithFormat:
-                    NSLocalizedString(@"subtitle.load.failed", nil),
-                    pathCopy.lastPathComponent, reason];
-
-                [self->_delegate playerCore:self didFailWithError:
-                    [self makeErrorWithDomain:@"KhuaPlayer" code:-30 description:msg
-                                        phase:@"subtitle" diagnosis:@"subtitleLoad" terminal:NO]];
-            }
+            NSString *msg = [NSString stringWithFormat:
+                NSLocalizedString(@"subtitle.load.failed", nil),
+                pathCopy.lastPathComponent, reason];
+            self->_listener->didFail({"KhuaPlayer", -30, spUTF8(msg), "subtitle", "subtitleLoad", false});
         });
     };
 
@@ -4219,10 +4213,7 @@ static BOOL spThumbsEnabled(void) {
 
     [self notifyFrameInterpolationDidChange];
 
-    id<SPPlayerCoreDelegate> delegate = self.delegate;
-    if ([delegate respondsToSelector:@selector(playerCoreDidChangeXDRAvailability:)]) {
-        [delegate playerCoreDidChangeXDRAvailability:self];
-    }
+    _listener->didChangeXDRAvailability();
 }
 
 - (void)captureScreenshotToPath:(NSString *)path completion:(void (^)(BOOL ok))completion {
@@ -7782,12 +7773,8 @@ static void spApplyDecodeQoS() {
         [self setState:SPPlayerStateFailed];
         if (_displayLink) _displayLink.paused = YES;
         if (_audioOutput) [_audioOutput stop];
-        if ([_delegate respondsToSelector:@selector(playerCore:didFailWithError:)]) {
-            NSError *derr = [self makeErrorWithDomain:@"SPDecodeError" code:-102
-                                          description:NSLocalizedString(@"error.decodeFailed", nil)
-                                                phase:@"decode" diagnosis:@"decodeFailed" terminal:YES];
-            [_delegate playerCore:self didFailWithError:derr];
-        }
+        _listener->didFail({"SPDecodeError", -102, spUTF8(NSLocalizedString(@"error.decodeFailed", nil)),
+                            "decode", "decodeFailed", true});
         return;
     }
 
@@ -8480,8 +8467,7 @@ static void spApplyDecodeQoS() {
     if (searching != _pubContentSearching) {
         _pubContentSearching = searching;
         if (spDebug()) SPLOG(@"[Resilient] 内容地图：%@", searching ? @"正在找下一段内容（提示）" : @"找完（收起提示）");
-        if ([_delegate respondsToSelector:@selector(playerCoreDidChangeSourceGrowth:)])
-            [_delegate playerCoreDidChangeSourceGrowth:self];
+        _listener->didChangeSourceGrowth();
         if (searching) [self scheduleContentSearchCheckAfterMs:250];
     }
     const Demuxer::SourceGrowthState g = _demuxer->sourceGrowthState();
@@ -8511,8 +8497,7 @@ static void spApplyDecodeQoS() {
     _pubSourceStalled = stalled;
     if (spDebug()) SPLOG(@"[Grow] 来源状态 growing=%d waiting=%d stalled=%d hint=%d size=%lld", (int)growing, (int)waiting,
                          (int)stalled, (int)g.downloadHint, (long long)g.liveSize);
-    if ([_delegate respondsToSelector:@selector(playerCoreDidChangeSourceGrowth:)])
-        [_delegate playerCoreDidChangeSourceGrowth:self];
+    _listener->didChangeSourceGrowth();
 }
 
 - (BOOL)sourceGrowing { return _pubSourceGrowing; }
@@ -8548,15 +8533,13 @@ static void spApplyDecodeQoS() {
             if (done) {
                 [s cancelIndexWait];
                 SPLOG(@"[Grow] %@：重新打开", v == IndexWaitVerdict::Ready ? @"索引已下载到" : @"写入方已完成");
-                if ([s->_delegate respondsToSelector:@selector(playerCoreWaitedSourceBecameReady:)])
-                    [s->_delegate playerCoreWaitedSourceBecameReady:s];
+                s->_listener->waitedSourceBecameReady();
                 return;
             }
             const BOOL stalled = v == IndexWaitVerdict::Stalled;
             if (stalled == s->_indexWaitStalled) return;
             s->_indexWaitStalled = stalled;
-            if ([s->_delegate respondsToSelector:@selector(playerCoreDidChangeSourceGrowth:)])
-                [s->_delegate playerCoreDidChangeSourceGrowth:s];
+            s->_listener->didChangeSourceGrowth();
         });
     });
     selfTimer->set(_indexWaitTimer);
@@ -9083,9 +9066,7 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     const BOOL leftOpening = (_state == SPPlayerStateOpening);
     _state = state;
     _backgroundPlaybackState.store(state, std::memory_order_release);
-    if ([_delegate respondsToSelector:@selector(playerCore:didChangeState:)]) {
-        [_delegate playerCore:self didChangeState:state];
-    }
+    _listener->didChangeState((sp::PlayerState)state);
 
     if (leftOpening && _audioOutput && [_audioOutput outputLayoutChangePending]) {
         sp::mainThread().post(^{ [self handleAudioOutputLayoutChange]; });
@@ -9105,9 +9086,7 @@ alignToleranceUs:(int64_t)alignToleranceUs {
         _dbgPosJumpLastPos = _position;
         _dbgPosJumpLastGen = gen;
     }
-    if ([_delegate respondsToSelector:@selector(playerCore:didUpdatePosition:duration:)]) {
-        [_delegate playerCore:self didUpdatePosition:_position duration:_duration];
-    }
+    _listener->didUpdatePosition(_position, _duration);
 }
 
 NSErrorUserInfoKey const SPPlayerErrorPhaseKey = @"SPPlayerErrorPhase";
@@ -9318,8 +9297,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     sp::mainThread().post(^{
         SPPlayerCore *s = weakSelf;
         if (!s || s->_openGeneration.load(std::memory_order_acquire) != og) return;
-        if ([s->_delegate respondsToSelector:@selector(playerCore:didSkipMissingContentFrom:to:afterSeek:)])
-            [s->_delegate playerCore:s didSkipMissingContentFrom:fromUs / 1e6 to:toUs / 1e6 afterSeek:afterSeek];
+        s->_listener->didSkipMissingContent(fromUs / 1e6, toUs / 1e6, afterSeek);
     });
 }
 
@@ -9372,9 +9350,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     }
     _damageNotifyWallUs = now;
     _damageNotifyHopQueued.store(false, std::memory_order_release);
-    if ([_delegate respondsToSelector:@selector(playerCoreDidUpdateTimelinePreview:)]) {
-        [_delegate playerCoreDidUpdateTimelinePreview:self];
-    }
+    _listener->didUpdateTimelinePreview();
 }
 
 - (void)resilientInvalidateSnapshot {
@@ -9558,10 +9534,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
                 name ?: NSLocalizedString(@"media.value.none", nil);
             self->_mediaInfoSnapshot = [m copy];
         }
-        id<SPPlayerCoreDelegate> d = self->_delegate;
-        if ([d respondsToSelector:@selector(playerCoreDidChangeDecoder:)]) {
-            [d playerCoreDidChangeDecoder:self];
-        }
+        self->_listener->didChangeDecoder();
     });
 }
 
@@ -10167,12 +10140,8 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 }
 
 - (void)failWithFFmpegError:(int)code operation:(NSString *)op {
-    if ([_delegate respondsToSelector:@selector(playerCore:didFailWithError:)]) {
-        NSError *err = [self makeErrorWithDomain:@"SPDemuxerError" code:code
-                                     description:[NSString stringWithFormat:NSLocalizedString(@"error.operationFailedFmt", nil), op, av_err2str(code)]
-                                           phase:@"read" diagnosis:@"readWarning" terminal:NO];
-        [_delegate playerCore:self didFailWithError:err];
-    }
+    NSString *desc = [NSString stringWithFormat:NSLocalizedString(@"error.operationFailedFmt", nil), op, av_err2str(code)];
+    _listener->didFail({"SPDemuxerError", code, spUTF8(desc), "read", "readWarning", false});
 }
 
 #pragma mark - Properties
