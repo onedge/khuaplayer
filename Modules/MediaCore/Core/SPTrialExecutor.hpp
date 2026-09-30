@@ -27,7 +27,7 @@
 #include <string>
 #include <thread>
 
-#include "Platform/SPFileSystem.hpp"
+#include <sys/stat.h>
 
 namespace sptrial {
 
@@ -95,8 +95,7 @@ inline int64_t monotonicNowUs() {
 
 struct SourceIdentity {
     std::string path;
-    // inoHigh carries the upper half of a 128-bit Windows file ID; zero on POSIX.
-    uint64_t dev = 0, ino = 0, inoHigh = 0;
+    uint64_t dev = 0, ino = 0;
     int64_t size = -1;
     int64_t mtimeNs = 0;
     uint64_t headHash = 0;
@@ -111,12 +110,11 @@ inline uint64_t fnv1a(const uint8_t* d, size_t n, uint64_t h = 14695981039346656
 inline bool captureSource(const std::string& path, SourceIdentity& out) {
     out = SourceIdentity{};
     out.path = path;
-    spfs::FileStat sb;
-    if (!spfs::statPath(path, &sb) || !sb.regular) return false;
-    out.dev = sb.identity.volume; out.ino = sb.identity.fileLow; out.inoHigh = sb.identity.fileHigh;
-    out.size = sb.size;
-    out.mtimeNs = sb.mtimeNs;
-    FILE* f = spfs::openForReading(path);
+    struct stat sb {};
+    if (::stat(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return false;
+    out.dev = (uint64_t)sb.st_dev; out.ino = (uint64_t)sb.st_ino; out.size = (int64_t)sb.st_size;
+    out.mtimeNs = (int64_t)sb.st_mtimespec.tv_sec * 1000000000ll + sb.st_mtimespec.tv_nsec;
+    FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     uint8_t buf[4096];
     const size_t n = std::fread(buf, 1, sizeof buf, f);
@@ -130,8 +128,7 @@ inline bool sourceUnchanged(const SourceIdentity& id) {
     if (!id.valid) return false;
     SourceIdentity now;
     if (!captureSource(id.path, now)) return false;
-    return now.dev == id.dev && now.ino == id.ino && now.inoHigh == id.inoHigh && now.size == id.size &&
-           now.mtimeNs == id.mtimeNs && now.headHash == id.headHash;
+    return now.dev == id.dev && now.ino == id.ino && now.size == id.size && now.mtimeNs == id.mtimeNs && now.headHash == id.headHash;
 }
 
 // ───────────────────────── Executor ─────────────────────────

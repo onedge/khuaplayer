@@ -18,21 +18,28 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 #include <algorithm>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <fcntl.h>
 #include <chrono>
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <pthread.h>
+#include <libproc.h>
+#include <sys/mount.h>
+#include <sys/proc_info.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <thread>
+#include <time.h>
+#include <unistd.h>
 
 #include "../Bridge/SPRuntimeGates.hpp"
-#include "Platform/SPErrno.hpp"
-#include "Platform/SPFileSystem.hpp"
-#include "Platform/SPThread.hpp"
 #include "SPTrialDecode.hpp"
 #include "SPSourceInput.hpp"
 #include "SPMp4InferredRecovery.hpp"
@@ -45,10 +52,11 @@ namespace sp {
 static bool isRealVideoStream(const AVStream* s);
 
 struct LocalFileIO {
-    spfs::Handle fd = spfs::kInvalidHandle;
+    int fd = -1;
     int64_t size = 0;
-    spfs::FileIdentity sourceId;
-    int64_t sourceMtimeNs = 0;
+    dev_t sourceDev = 0;
+    ino_t sourceIno = 0;
+    timespec sourceMtime{};
     bool localFilesystem = false;
     std::atomic<bool> viewAttached{true};
     std::atomic<bool> openingViewActive{false};
@@ -69,7 +77,7 @@ struct LocalFileIO {
 
     std::atomic<bool> inRead{false};
     std::atomic<bool> abortRequested{false};
-    std::atomic<spfs::ThreadId> ioThread{0};
+    std::atomic<pthread_t> ioThread{};
 
     std::atomic<bool> readerActive{false};
     std::mutex jobMtx;
@@ -81,7 +89,7 @@ struct LocalFileIO {
     size_t jobWant = 0;
     uint8_t* jobBuf = nullptr;
     int64_t jobHardStallUs = 0;
-    int64_t jobN = 0;
+    ssize_t jobN = 0;
     int jobErrno = 0;
 
     uint64_t readFaults = 0;
@@ -169,14 +177,14 @@ struct LocalFileIO {
 
     bool jobStat = false;
     bool jobStatWantPath = false;
-    spfs::FileStat jobSb {};
+    struct stat jobSb {};
     int jobStatErrno = 0;
     std::string jobStatPath;
     bool jobStatAria2 = false;
 
     ~LocalFileIO() {
         for (ReadBlock& b : blocks) av_free(b.buf);
-        spfs::close(fd);
+        if (fd >= 0) ::close(fd);
     }
 };
 
@@ -184,17 +192,18 @@ static bool spLocalSourceUnchanged(const LocalFileIO& io) {
 
     const auto mode = (spgrow::Mode)io.growthMode.load(std::memory_order_relaxed);
     const int64_t baseSize = io.size;
-    const int64_t baseMtimeNs = io.sourceMtimeNs;
-    spfs::FileStat sb {};
-    if (!(spfs::valid(io.fd) && spfs::stat(io.fd, &sb) && sb.regular &&
-          sb.identity == io.sourceId)) return false;
+    const timespec baseMtime = io.sourceMtime;
+    struct stat sb {};
+    if (!(io.fd >= 0 && fstat(io.fd, &sb) == 0 && S_ISREG(sb.st_mode) &&
+          sb.st_dev == io.sourceDev && sb.st_ino == io.sourceIno)) return false;
 
-    if (mode == spgrow::Mode::Growing || mode == spgrow::Mode::Final) return sb.size >= baseSize;
-    return sb.size == baseSize && sb.mtimeNs == baseMtimeNs;
+    if (mode == spgrow::Mode::Growing || mode == spgrow::Mode::Final) return sb.st_size >= baseSize;
+    return sb.st_size == baseSize &&
+        sb.st_mtimespec.tv_sec == baseMtime.tv_sec && sb.st_mtimespec.tv_nsec == baseMtime.tv_nsec;
 }
 
-static spgrow::FileStamp spStampOf(const spfs::FileStat& sb) {
-    return {sb.size, sb.mtimeNs};
+static spgrow::FileStamp spStampOf(const struct stat& sb) {
+    return {(int64_t)sb.st_size, (int64_t)sb.st_mtimespec.tv_sec * 1000000000LL + sb.st_mtimespec.tv_nsec};
 }
 
 static int spRemoteReadGranule(int64_t seqBytes) {
@@ -203,18 +212,33 @@ static int spRemoteReadGranule(int64_t seqBytes) {
     return LocalFileIO::kStageCap;
 }
 
+static void spIONoopSignal(int) {}
 static void spEnsureIOInterruptSignalInstalled() {
-    spfs::installBlockingIoInterrupt();
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa {};
+        sa.sa_handler = spIONoopSignal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGUSR2, &sa, nullptr);
+    });
 }
 
 static void spSleepUninterruptible(int64_t us) {
-    spfs::sleepUninterruptible(us);
+    const int64_t deadline = spNowUs() + us;
+    for (int64_t now = spNowUs(); now < deadline; now = spNowUs()) {
+        struct timespec ts { 0, 0 };
+        const int64_t rem = deadline - now;
+        ts.tv_sec = rem / 1000000;
+        ts.tv_nsec = (rem % 1000000) * 1000;
+        nanosleep(&ts, nullptr);
+    }
 }
 
 static void spLocalIOReaderLoop(std::shared_ptr<LocalFileIO> io) {
-    spfs::setCurrentThreadName("sp.demux.io");
+    pthread_setname_np("sp.demux.io");
 
-    spfs::setCurrentThreadQos(spfs::ThreadQos::UserInteractive);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (;;) {
         std::unique_lock<std::mutex> lk(io->jobMtx);
         io->jobCv.wait(lk, [&] { return io->jobPending || io->quit; });
@@ -224,14 +248,17 @@ static void spLocalIOReaderLoop(std::shared_ptr<LocalFileIO> io) {
 
             const bool wantPath = io->jobStatWantPath;
             lk.unlock();
-            spfs::FileStat sb {};
-            int err = EINTR;
-            if (!io->abortRequested.load()) spfs::stat(io->fd, &sb, &err);
+            struct stat sb {};
+            int err = io->abortRequested.load() ? EINTR : (fstat(io->fd, &sb) == 0 ? 0 : errno);
             std::string path;
             bool aria2 = false;
             if (!err && wantPath) {
-                path = spfs::currentPath(io->fd);
-                if (!path.empty()) aria2 = spfs::pathExists(path + ".aria2");
+                char buf[MAXPATHLEN] = {0};
+                if (fcntl(io->fd, F_GETPATH, buf) != -1) {
+                    path = buf;
+                    struct stat ab {};
+                    aria2 = stat((path + ".aria2").c_str(), &ab) == 0;
+                }
             }
             lk.lock();
             io->jobSb = sb;
@@ -248,14 +275,15 @@ static void spLocalIOReaderLoop(std::shared_ptr<LocalFileIO> io) {
         uint8_t* dst = io->jobBuf;
         const int64_t hardStallUs = io->jobHardStallUs;
         lk.unlock();
-        io->ioThread.store(spfs::currentThreadId(), std::memory_order_relaxed);
+        io->ioThread.store(pthread_self(), std::memory_order_relaxed);
         io->inRead.store(true);
-        int64_t n = -1;
+        ssize_t n = -1;
         int err = EINTR;
         if (hardStallUs > 0) spSleepUninterruptible(hardStallUs);
         if (!io->abortRequested.load()) {
             do {
-                n = spfs::readAt(io->fd, dst, want, pos, &err);
+                n = pread(io->fd, dst, want, pos);
+                err = n < 0 ? errno : 0;
 
             } while (n < 0 && err == EINTR && !io->abortRequested.load());
         }
@@ -270,7 +298,7 @@ static void spLocalIOReaderLoop(std::shared_ptr<LocalFileIO> io) {
 }
 
 static bool spLocalIOSubmitRead(LocalFileIO* io, uint8_t* dst, size_t want, int64_t pos,
-                                int64_t hardStallUs, int64_t* outN, int* outErrno) {
+                                int64_t hardStallUs, ssize_t* outN, int* outErrno) {
     std::unique_lock<std::mutex> lk(io->jobMtx);
     io->jobStat = false;
     io->jobPos = pos;
@@ -294,8 +322,8 @@ static bool spLocalIOSubmitRead(LocalFileIO* io, uint8_t* dst, size_t want, int6
 }
 
 static void spLocalIOInlineRead(LocalFileIO* io, uint8_t* dst, size_t want, int64_t pos,
-                                int64_t hardStallUs, int64_t* outN, int* outErrno) {
-    io->ioThread.store(spfs::currentThreadId(), std::memory_order_relaxed);
+                                int64_t hardStallUs, ssize_t* outN, int* outErrno) {
+    io->ioThread.store(pthread_self(), std::memory_order_relaxed);
     io->inRead.store(true);
 
     if (io->abortFlag && io->abortFlag->load()) {
@@ -305,10 +333,11 @@ static void spLocalIOInlineRead(LocalFileIO* io, uint8_t* dst, size_t want, int6
         return;
     }
     if (hardStallUs > 0) spSleepUninterruptible(hardStallUs);
-    int64_t n;
+    ssize_t n;
     int savedErrno = 0;
     do {
-        n = spfs::readAt(io->fd, dst, want, pos, &savedErrno);
+        n = pread(io->fd, dst, want, pos);
+        savedErrno = n < 0 ? errno : 0;
 
     } while (n < 0 && savedErrno == EINTR &&
              !(io->abortFlag && io->abortFlag->load()));
@@ -317,12 +346,16 @@ static void spLocalIOInlineRead(LocalFileIO* io, uint8_t* dst, size_t want, int6
     *outErrno = savedErrno;
 }
 
-static bool spLocalIOStat(LocalFileIO* io, bool wantPath, spfs::FileStat* sb, int* statErrno, std::string* path, bool* aria2) {
+static bool spLocalIOStat(LocalFileIO* io, bool wantPath, struct stat* sb, int* statErrno, std::string* path, bool* aria2) {
     auto inlineStat = [&] {
-        spfs::stat(io->fd, sb, statErrno);
+        *statErrno = fstat(io->fd, sb) == 0 ? 0 : errno;
         if (!*statErrno && wantPath) {
-            *path = spfs::currentPath(io->fd);
-            if (!path->empty()) *aria2 = spfs::pathExists(*path + ".aria2");
+            char buf[MAXPATHLEN] = {0};
+            if (fcntl(io->fd, F_GETPATH, buf) != -1) {
+                *path = buf;
+                struct stat ab {};
+                *aria2 = stat((*path + ".aria2").c_str(), &ab) == 0;
+            }
         }
         return true;
     };
@@ -349,7 +382,7 @@ static bool spLocalIOStat(LocalFileIO* io, bool wantPath, spfs::FileStat* sb, in
     return true;
 }
 
-static void spGrowthObserve(LocalFileIO* io, const spfs::FileStat& sb, int64_t mono, bool pathChecked,
+static void spGrowthObserve(LocalFileIO* io, const struct stat& sb, int64_t mono, bool pathChecked,
                             const std::string& path, bool aria2) {
     const spgrow::FileStamp st = spStampOf(sb);
     if (st != io->growth.lastStamp) {
@@ -378,12 +411,12 @@ static void spGrowthObserve(LocalFileIO* io, const spfs::FileStat& sb, int64_t m
     if (pub) pub->lastGrowthUs.store(io->growth.lastUs, std::memory_order_relaxed);
 }
 
-static void spGrowthAdoptSize(LocalFileIO* io, const spfs::FileStat& sb) {
-    if (sb.size != io->size) {
+static void spGrowthAdoptSize(LocalFileIO* io, const struct stat& sb) {
+    if ((int64_t)sb.st_size != io->size) {
         std::lock_guard<std::mutex> lk(io->viewMutex);
-        if (io->virtualSize == io->size || io->virtualSize < sb.size) io->virtualSize = sb.size;
-        io->size = sb.size;
-        io->sourceMtimeNs = sb.mtimeNs;
+        if (io->virtualSize == io->size || io->virtualSize < (int64_t)sb.st_size) io->virtualSize = (int64_t)sb.st_size;
+        io->size = (int64_t)sb.st_size;
+        io->sourceMtime = sb.st_mtimespec;
     }
     if (io->growthPub) io->growthPub->liveSize.store(io->size, std::memory_order_relaxed);
 }
@@ -395,10 +428,37 @@ static void spSetGrowthMode(LocalFileIO* io, SourceGrowthPub* pub, spgrow::Mode 
 
 static int spPathWriterOpen(const std::string& path) {
 
+    struct stat target {};
+    if (::stat(path.c_str(), &target) != 0) return -1;
     const int64_t t0 = spNowUs();
-    int inspected = 0;
+    int result = -1, inspected = 0;
     bool unknown = false;
-    const int result = spfs::pathHasOtherWriter(path, &inspected, &unknown);
+    int bytes = proc_listpids(PROC_UID_ONLY, getuid(), nullptr, 0);
+    if (bytes > 0) {
+        std::vector<pid_t> pids((size_t)bytes / sizeof(pid_t) + 64);
+        bytes = proc_listpids(PROC_UID_ONLY, getuid(), pids.data(), (int)(pids.size() * sizeof(pid_t)));
+        const pid_t self = getpid();
+        const int n = bytes > 0 ? std::min<int>((int)pids.size(), bytes / (int)sizeof(pid_t)) : 0;
+        std::vector<proc_fdinfo> fds;
+        for (int i = 0; i < n && result != 1; ++i) {
+            const pid_t pid = pids[(size_t)i];
+            if (pid <= 0 || pid == self) continue;
+            const int need = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nullptr, 0);
+            if (need <= 0) { unknown = true; continue; }
+            fds.resize((size_t)need / sizeof(proc_fdinfo) + 8);
+            const int got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.data(), (int)(fds.size() * sizeof(proc_fdinfo)));
+            if (got <= 0) { unknown = true; continue; }
+            ++inspected;
+            for (int k = 0; k < got / (int)sizeof(proc_fdinfo); ++k) {
+                if (fds[(size_t)k].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+                vnode_fdinfo vi {};
+                if (proc_pidfdinfo(pid, fds[(size_t)k].proc_fd, PROC_PIDFDVNODEINFO, &vi, sizeof(vi)) != (int)sizeof(vi)) continue;
+                if ((dev_t)vi.pvi.vi_stat.vst_dev == target.st_dev && vi.pvi.vi_stat.vst_ino == target.st_ino &&
+                    (vi.pfi.fi_openflags & FWRITE)) { result = 1; break; }
+            }
+        }
+        if (result != 1) result = inspected > 0 ? 0 : -1;
+    }
     if (spDebug())
         fprintf(stderr, "[Grow] 写入方查询 %.2f ms（检查 %d 个进程%s）→ %d\n", (spNowUs() - t0) / 1000.0, inspected,
                 unknown ? "，另有读不到 fd 表的" : "", result);
@@ -435,12 +495,11 @@ constexpr int64_t kSuspectZeroSpan = 256 * 1024;
 constexpr int64_t kSuspectZeroMaxWaitUs = 2000000;
 
 static bool spZeroIsSparse(const LocalFileIO* io, int64_t pos, int64_t len) {
-    if (io->remote || !io->localFilesystem || !spfs::valid(io->fd)) return false;
+    if (io->remote || !io->localFilesystem || io->fd < 0) return false;
     const int64_t a = (pos + 4095) & ~(int64_t)4095;
     if (a + 4096 > pos + len) return false;
-    int64_t dataBegin = 0, dataEnd = 0;
-    const int found = spfs::nextAllocatedRange(io->fd, a, &dataBegin, &dataEnd);
-    return found == 0 || (found > 0 && dataBegin > a);
+    const off_t d = lseek(io->fd, (off_t)a, SEEK_DATA);
+    return d > (off_t)a || (d < 0 && errno == ENXIO);
 }
 
 static int spLocalIOAwaitGrowth(LocalFileIO* io, int64_t zeroAt = -1, int64_t zeroLen = spgrow::kPendingZeroRun) {
@@ -485,7 +544,7 @@ static int spLocalIOAwaitGrowth(LocalFileIO* io, int64_t zeroAt = -1, int64_t ze
         const int64_t mono = spNowUs();
 
         const bool wantPath = spGrowthWantPath(io, mono);
-        spfs::FileStat sb {};
+        struct stat sb {};
         int statErrno = 0;
         std::string path;
         bool aria2 = false;
@@ -498,7 +557,9 @@ static int spLocalIOAwaitGrowth(LocalFileIO* io, int64_t zeroAt = -1, int64_t ze
         in.readPos = io->pos;
         in.downloadHint = io->growth.hint;
         in.hadDownloadHint = io->growth.hadHint;
-        in.wallNowNs = spfs::wallClockNowNs();
+        struct timespec wall {};
+        clock_gettime(CLOCK_REALTIME, &wall);
+        in.wallNowNs = (int64_t)wall.tv_sec * 1000000000LL + wall.tv_nsec;
         in.monoNowUs = mono;
         in.lastGrowthUs = io->growth.lastUs;
         in.probeStartUs = io->growth.probeStartUs;
@@ -578,7 +639,7 @@ static int64_t spAuxStallUs() {
 }
 
 static int64_t spLocalIOReadOutsideAvio(LocalFileIO* io, int64_t pos, uint8_t* out, size_t n, bool retainLanding = true) {
-    if (!io || !spfs::valid(io->fd) || pos < 0 || (!out && n)) return AVERROR(EINVAL);
+    if (!io || io->fd < 0 || pos < 0 || (!out && n)) return AVERROR(EINVAL);
     if ((io->abortFlag && io->abortFlag->load()) || io->abortRequested.load()) return AVERROR_EXIT;
     if (n == 0) return 0;
     const int64_t stallUs = spAuxStallUs();
@@ -593,7 +654,7 @@ static int64_t spLocalIOReadOutsideAvio(LocalFileIO* io, int64_t pos, uint8_t* o
     }
     size_t done = 0;
     while (done < n) {
-        int64_t got = -1;
+        ssize_t got = -1;
         int err = 0;
         if (viaReader) {
             const size_t chunk = std::min(n - done, io->auxLanding.size());
@@ -614,7 +675,7 @@ static int64_t spLocalIOReadOutsideAvio(LocalFileIO* io, int64_t pos, uint8_t* o
 }
 
 static int64_t spLocalIOReadSwap(LocalFileIO* io, int64_t pos, size_t n, std::vector<uint8_t>& dst) {
-    if (!io || !spfs::valid(io->fd) || pos < 0) return AVERROR(EINVAL);
+    if (!io || io->fd < 0 || pos < 0) return AVERROR(EINVAL);
     if ((io->abortFlag && io->abortFlag->load()) || io->abortRequested.load()) return AVERROR_EXIT;
     bool swapPath = n > 0 && n <= LocalFileIO::kAuxLandingCap && io->readerActive.load(std::memory_order_relaxed);
     if (swapPath) {
@@ -631,7 +692,7 @@ static int64_t spLocalIOReadSwap(LocalFileIO* io, int64_t pos, size_t n, std::ve
     const int64_t stallUs = spAuxStallUs();
     size_t done = 0;
     while (done < n) {
-        int64_t got = -1;
+        ssize_t got = -1;
         int err = 0;
         if (!spLocalIOSubmitRead(io, io->auxLanding.data() + done, n - done, pos + (int64_t)done, done == 0 ? stallUs : 0, &got, &err)) return AVERROR_EXIT;
         if (got < 0) return err == EINTR ? AVERROR_EXIT : AVERROR(err);
@@ -643,14 +704,14 @@ static int64_t spLocalIOReadSwap(LocalFileIO* io, int64_t pos, size_t n, std::ve
 }
 
 static int64_t spLocalIOReadIntoOwned(LocalFileIO* io, int64_t pos, uint8_t* owned, size_t n) {
-    if (!io || !spfs::valid(io->fd) || pos < 0 || (!owned && n)) return AVERROR(EINVAL);
+    if (!io || io->fd < 0 || pos < 0 || (!owned && n)) return AVERROR(EINVAL);
     if ((io->abortFlag && io->abortFlag->load()) || io->abortRequested.load()) return AVERROR_EXIT;
     if (n == 0) return 0;
     const int64_t stallUs = spAuxStallUs();
     const bool viaReader = io->readerActive.load(std::memory_order_relaxed);
     size_t done = 0;
     while (done < n) {
-        int64_t got = -1;
+        ssize_t got = -1;
         int err = 0;
         if (viaReader) {
             if (!spLocalIOSubmitRead(io, owned + done, n - done, pos + (int64_t)done, done == 0 ? stallUs : 0, &got, &err)) return AVERROR_EXIT;
@@ -675,12 +736,12 @@ static bool spRunAbandonable(const std::shared_ptr<LocalFileIO>& io, const char*
     std::shared_ptr<Slot> slot;
     try { slot = std::make_shared<Slot>(); } catch (const std::bad_alloc&) { return false; }
 
-    spfs::ThreadQos qos = spfs::currentThreadQos();
-    if (qos == spfs::ThreadQos::Unspecified) qos = spfs::ThreadQos::UserInitiated;
+    qos_class_t qos = qos_class_self();
+    if (qos == QOS_CLASS_UNSPECIFIED) qos = QOS_CLASS_USER_INITIATED;
     try {
         std::thread([io, slot, threadName, qos, work = std::forward<Work>(work)]() mutable {
-            spfs::setCurrentThreadName(threadName);
-            spfs::setCurrentThreadQos(qos);
+            pthread_setname_np(threadName);
+            pthread_set_qos_class_self_np(qos, 0);
             if (const int64_t stallUs = spAuxStallUs()) spSleepUninterruptible(stallUs);
             R r = work(slot->cancel);
             {
@@ -706,26 +767,26 @@ static bool spRunAbandonable(const std::shared_ptr<LocalFileIO>& io, const char*
 struct AuxIOCancelToken {
     std::atomic<bool> cancel{false};
     std::atomic<bool> inRead{false};
-    std::atomic<spfs::ThreadId> tid{0};
+    std::atomic<pthread_t> tid{};
 
     std::mutex waitMtx;
     std::condition_variable waitCv;
 };
 
-static int64_t spAuxPread(AuxIOCancelToken& t, spfs::Handle fd, void* buf, size_t len,
+static ssize_t spAuxPread(AuxIOCancelToken& t, int fd, void* buf, size_t len,
                           int64_t off) {
-    t.tid.store(spfs::currentThreadId(), std::memory_order_relaxed);
+    t.tid.store(pthread_self(), std::memory_order_relaxed);
     t.inRead.store(true);
 
     if (t.cancel.load()) {
         t.inRead.store(false);
+        errno = EINTR;
         return -1;
     }
-    int64_t n;
-    int err = 0;
+    ssize_t n;
     do {
-        n = spfs::readAt(fd, buf, len, off, &err);
-    } while (n < 0 && err == EINTR && !t.cancel.load());
+        n = pread(fd, buf, len, off);
+    } while (n < 0 && errno == EINTR && !t.cancel.load());
     t.inRead.store(false);
     return n;
 }
@@ -740,8 +801,10 @@ static void spAuxCancel(const std::shared_ptr<AuxIOCancelToken>& t) {
     std::shared_ptr<AuxIOCancelToken> keep = t;
     std::thread([keep] {
         for (int i = 0; i < 4 && keep->inRead.load(); ++i) {
-            spfs::interruptBlockingIo(keep->tid.load(std::memory_order_relaxed));
-            spfs::sleepMicroseconds(50 * 1000);
+            pthread_t th = keep->tid.load(std::memory_order_relaxed);
+            if (th) pthread_kill(th, SIGUSR2);
+            struct timespec ts { 0, 50 * 1000 * 1000 };
+            nanosleep(&ts, nullptr);
         }
     }).detach();
 }
@@ -1035,7 +1098,7 @@ static int spLocalIOReadRaw(void* opaque, uint8_t* buf, int len) {
 
         const int64_t observeEveryUs = mono - io->growth.openMonoUs < 2000000 ? 100000 : 1000000;
         if (mono - io->growth.lastObserveUs >= observeEveryUs) {
-            spfs::FileStat sb {};
+            struct stat sb {};
             int statErrno = 0;
             std::string path;
             bool aria2 = false;
@@ -1046,7 +1109,7 @@ static int spLocalIOReadRaw(void* opaque, uint8_t* buf, int len) {
                 if (gm == (uint8_t)spgrow::Mode::Static && spStampOf(sb) != io->growth.atOpen) {
 
                     spSetGrowthMode(io, io->growthPub.get(), spgrow::Mode::Growing);
-                    if (io->debug) fprintf(stderr, "[Grow] 播放途中发现文件在变：转入增长模式 size=%lld\n", (long long)sb.size);
+                    if (io->debug) fprintf(stderr, "[Grow] 播放途中发现文件在变：转入增长模式 size=%lld\n", (long long)sb.st_size);
                 }
                 if (io->growthMode.load(std::memory_order_relaxed) == (uint8_t)spgrow::Mode::Growing) spGrowthAdoptSize(io, sb);
             }
@@ -1081,7 +1144,7 @@ static int spLocalIOReadRaw(void* opaque, uint8_t* buf, int len) {
             } else {
                 while (spNowUs() < deadline &&
                        !(io->abortFlag && io->abortFlag->load()))
-                    spfs::sleepMicroseconds(50000);
+                    usleep(50000);
             }
         }
     }
@@ -1121,7 +1184,7 @@ static int spLocalIOReadRaw(void* opaque, uint8_t* buf, int len) {
     uint8_t* dst = blk ? blk->buf : buf;
 
     const bool viaReader = blk && io->readerActive.load(std::memory_order_relaxed);
-    int64_t n = -1;
+    ssize_t n = -1;
     int savedErrno = 0;
     if (viaReader) {
         if (!spLocalIOSubmitRead(io, dst, want, io->pos, hardStallUs, &n, &savedErrno)) {
@@ -1187,7 +1250,7 @@ static int spLocalIOReadRaw(void* opaque, uint8_t* buf, int len) {
             if (g > 0) return spLocalIOReadRaw(opaque, buf, len);
             if (g < 0) return g;
         } else if (k < (int64_t)n) {
-            n = k;
+            n = (ssize_t)k;
         }
     }
 
@@ -1254,26 +1317,32 @@ static bool spIsPlainPath(const std::string& path) {
 bool Demuxer::attachLocalIO(const std::string& path, const std::shared_ptr<LocalFileIO>& source) {
     if (!spIsPlainPath(path)) return false;
     if (source && !spLocalSourceUnchanged(*source)) return false;
-    spfs::Handle fd = source ? spfs::duplicate(source->fd) : spfs::openForRead(path);
-    if (!spfs::valid(fd)) return false;
-    spfs::FileStat sb {};
-    if (!spfs::stat(fd, &sb) || !sb.regular) {
-        spfs::close(fd);
+    int fd = source ? fcntl(source->fd, F_DUPFD_CLOEXEC, 0) : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat sb {};
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        ::close(fd);
         return false;
     }
 
-    spfs::adviseReadAhead(fd);
+    (void)fcntl(fd, F_RDAHEAD, 1);
 
-    const spfs::VolumeInfo volume = spfs::volume(fd);
-    remoteVolume_ = volume.remote;
+    remoteVolume_ = false;
+    struct statfs sfs {};
+    if (fstatfs(fd, &sfs) == 0) {
+        const char* t = sfs.f_fstypename;
+        remoteVolume_ = strcmp(t, "smbfs") == 0 || strcmp(t, "afpfs") == 0 ||
+                        strcmp(t, "nfs") == 0 || strcmp(t, "webdav") == 0;
+    }
 
     std::shared_ptr<LocalFileIO> io;
     try { io = std::make_shared<LocalFileIO>(); }
-    catch (const std::bad_alloc&) { spfs::close(fd); return false; }
+    catch (const std::bad_alloc&) { ::close(fd); return false; }
     io->fd = fd;
-    io->size = source ? source->size : sb.size;
-    io->sourceId = source ? source->sourceId : sb.identity;
-    io->sourceMtimeNs = source ? source->sourceMtimeNs : sb.mtimeNs;
+    io->size = source ? source->size : (int64_t)sb.st_size;
+    io->sourceDev = source ? source->sourceDev : sb.st_dev;
+    io->sourceIno = source ? source->sourceIno : sb.st_ino;
+    io->sourceMtime = source ? source->sourceMtime : sb.st_mtimespec;
     io->growthPub = growthPub_;
     io->growthYield = growthYield_;
     if (source) {
@@ -1286,7 +1355,9 @@ bool Demuxer::attachLocalIO(const std::string& path, const std::shared_ptr<Local
         io->growth.lastUs = spNowUs();
         io->growth.openMonoUs = io->growth.lastUs;
         {
-            io->growth.openWallNs = spfs::wallClockNowNs();
+            struct timespec wall {};
+            clock_gettime(CLOCK_REALTIME, &wall);
+            io->growth.openWallNs = (int64_t)wall.tv_sec * 1000000000LL + wall.tv_nsec;
             const int64_t ageNs = io->growth.openWallNs - io->growth.atOpen.mtimeNs;
             io->growth.watch = ageNs < spgrow::kWatchRecentNs || spgrow::pathHasDownloadSuffix(path);
         }
@@ -1296,7 +1367,7 @@ bool Demuxer::attachLocalIO(const std::string& path, const std::shared_ptr<Local
         growthPub_->downloadHint.store(false, std::memory_order_relaxed);
         growthPub_->pendingZeroPos.store(-1, std::memory_order_relaxed);
         growthPub_->inPlaceFill.store(false, std::memory_order_relaxed);
-        growthPub_->liveSize.store(sb.size, std::memory_order_relaxed);
+        growthPub_->liveSize.store((int64_t)sb.st_size, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(growthPub_->pathMtx);
         growthPub_->path.clear();
         std::lock_guard<std::mutex> jlk(pendingJobMtx_);
@@ -1305,19 +1376,14 @@ bool Demuxer::attachLocalIO(const std::string& path, const std::shared_ptr<Local
         byteTimeMapCaptured_ = false;
     }
     if (source && !spLocalSourceUnchanged(*io)) return false;
-    io->localFilesystem = volume.local;
+    io->localFilesystem = (sfs.f_flags & MNT_LOCAL) != 0;
     io->abortFlag = &abortIO_;
     io->debug = spDebug();
     io->remote = remoteVolume_;
 
     if (!source && io->growth.watch && io->localFilesystem && !io->remote && io->size > 0) {
-        // A hole before end of file: no data at all, data starting after 0,
-        // or a first data run ending early (a failed SEEK_HOLE reports end <= begin).
-        int64_t dataBegin = 0, dataEnd = 0;
-        const int found = spfs::nextAllocatedRange(io->fd, 0, &dataBegin, &dataEnd);
-        const bool holeBeforeEnd =
-            found == 0 || (found > 0 && (dataBegin > 0 || (dataEnd > dataBegin && dataEnd < io->size)));
-        if (holeBeforeEnd &&
+        const off_t hole = lseek(io->fd, 0, SEEK_HOLE);
+        if (hole >= 0 && (int64_t)hole < io->size &&
             (spgrow::pathHasDownloadSuffix(path) || spPathWriterOpen(path) == 1)) {
             io->growth.inPlaceFill = true;
             growthPub_->inPlaceFill.store(true, std::memory_order_relaxed);
@@ -1485,11 +1551,11 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job) {
         std::lock_guard<std::mutex> lk(job.mapMtx);
         path = job.path;
     }
-    const spfs::Handle fd = spfs::openForRead(path);
-    if (!spfs::valid(fd)) return out;
-    spfs::FileStat sb {};
-    if (!spfs::stat(fd, &sb) || sb.size <= 0) { spfs::close(fd); return out; }
-    const int64_t size = sb.size;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return out;
+    struct stat sb {};
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { ::close(fd); return out; }
+    const int64_t size = sb.st_size;
     std::vector<std::pair<int64_t, int64_t>> map;
     int64_t dur;
     {
@@ -1497,7 +1563,7 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job) {
         map = job.map;
         dur = job.durationUs;
     }
-    if (dur <= 0) { spfs::close(fd); return out; }
+    if (dur <= 0) { ::close(fd); return out; }
     std::vector<std::pair<int64_t, int64_t>> bytes;
     if (!job.pub->inPlaceFill.load(std::memory_order_relaxed)) {
         bytes.emplace_back(size, INT64_MAX);
@@ -1505,10 +1571,10 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job) {
 
         if (!job.remote) {
             for (int64_t off = 0; off < size && !job.cancelled.load();) {
-                int64_t d = 0, h = 0;
-                const int found = spfs::nextAllocatedRange(fd, off, &d, &h);
-                if (found <= 0) { if (found == 0) bytes.emplace_back(off, size); break; }
-                if (d > off) bytes.emplace_back(off, d);
+                const off_t d = lseek(fd, (off_t)off, SEEK_DATA);
+                if (d < 0) { if (errno == ENXIO) bytes.emplace_back(off, size); break; }
+                if (d > off) bytes.emplace_back(off, (int64_t)d);
+                const off_t h = lseek(fd, d, SEEK_HOLE);
                 if (h <= d) break;
                 off = h;
             }
@@ -1529,8 +1595,7 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job) {
                 if (job.present[c]) continue;
                 --budget;
                 const int64_t off = (int64_t)c * job.granule;
-                int err = 0;
-                const int64_t got = spfs::readAt(fd, probe, (size_t)std::min<int64_t>(sizeof probe, size - off), off, &err);
+                const ssize_t got = pread(fd, probe, (size_t)std::min<int64_t>(sizeof probe, size - off), off);
                 if (got > 0 && !spresil::allZero(probe, (size_t)got)) job.present[c] = 1;
                 job.cursor = (c + 1) % nChunks;
             }
@@ -1542,7 +1607,7 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job) {
             }
         }
     }
-    spfs::close(fd);
+    ::close(fd);
     for (const auto& r : bytes) {
         if (r.second != INT64_MAX && r.second - r.first < 64 * 1024) continue;
         const int64_t t0 = std::max<int64_t>(0, spPendingPosToUs(map, r.first, size, dur));
@@ -1554,17 +1619,16 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job) {
     return out;
 }
 
-static bool spMp4TopLevelMoovComplete(spfs::Handle fd, int64_t size) {
+static bool spMp4TopLevelMoovComplete(int fd, int64_t size) {
     auto be32 = [](const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; };
     auto printable = [](const uint8_t* p) {
         for (int i = 0; i < 4; ++i) if (p[i] < 0x20 || p[i] > 0x7e) return false;
         return true;
     };
-    int err = 0;
     int64_t off = 0;
     for (int guard = 0; guard < 4096 && off + 8 <= size; ++guard) {
         uint8_t h[16] = {};
-        if (spfs::readAt(fd, h, sizeof h, off, &err) < 8 || !printable(h + 4)) return false;
+        if (pread(fd, h, sizeof h, off) < 8 || !printable(h + 4)) return false;
         uint64_t sz = be32(h);
         int hdr = 8;
         if (sz == 1) { sz = (uint64_t)be32(h + 8) << 32 | be32(h + 12); hdr = 16; }
@@ -1573,7 +1637,7 @@ static bool spMp4TopLevelMoovComplete(spfs::Handle fd, int64_t size) {
         if (memcmp(h + 4, "moov", 4) == 0) {
             if (off + (int64_t)sz > size) return false;
             uint8_t c[8] = {};
-            return spfs::readAt(fd, c, sizeof c, off + hdr, &err) == (int64_t)sizeof c && printable(c + 4);
+            return pread(fd, c, sizeof c, off + hdr) == (ssize_t)sizeof c && printable(c + 4);
         }
         off += (int64_t)sz;
     }
@@ -1581,14 +1645,16 @@ static bool spMp4TopLevelMoovComplete(spfs::Handle fd, int64_t size) {
 }
 
 IndexWaitVerdict spProbeIndexWait(const std::string& path, IndexWaitState& st) {
-    spfs::FileStat sb {};
-    if (!spfs::statPath(path, &sb) || !sb.regular) return st.started ? IndexWaitVerdict::Finished : IndexWaitVerdict::NotWritten;
+    struct stat sb {};
+    if (stat(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return st.started ? IndexWaitVerdict::Finished : IndexWaitVerdict::NotWritten;
     const int64_t mono = spNowUs();
     const spgrow::FileStamp now = spStampOf(sb);
     const bool first = !st.started;
     if (first) {
         st.started = true;
-        st.openWallNs = spfs::wallClockNowNs();
+        struct timespec w0 {};
+        clock_gettime(CLOCK_REALTIME, &w0);
+        st.openWallNs = (int64_t)w0.tv_sec * 1000000000LL + w0.tv_nsec;
         st.atOpenSize = st.lastSize = now.size;
         st.atOpenMtimeNs = st.lastMtimeNs = now.mtimeNs;
         st.lastGrowthUs = mono;
@@ -1597,15 +1663,17 @@ IndexWaitVerdict spProbeIndexWait(const std::string& path, IndexWaitState& st) {
         st.lastMtimeNs = now.mtimeNs;
         st.lastGrowthUs = mono;
     }
-    const spfs::Handle fd = spfs::openForRead(path);
-    if (spfs::valid(fd)) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
         const bool ready = spMp4TopLevelMoovComplete(fd, now.size);
-        spfs::close(fd);
+        ::close(fd);
         if (ready) return IndexWaitVerdict::Ready;
     }
-    const bool hint = spgrow::pathHasDownloadSuffix(path) || spfs::pathExists(path + ".aria2");
+    struct stat side {};
+    const bool hint = spgrow::pathHasDownloadSuffix(path) || stat((path + ".aria2").c_str(), &side) == 0;
     if (hint) st.hadHint = true;
-    const bool local = spfs::volumeOfPath(path).local;
+    struct statfs sfs {};
+    const bool local = statfs(path.c_str(), &sfs) == 0 && (sfs.f_flags & MNT_LOCAL) != 0;
     spgrow::Inputs in;
     in.mode = (spgrow::Mode)st.mode;
     in.atOpen = {st.atOpenSize, st.atOpenMtimeNs};
@@ -1614,7 +1682,9 @@ IndexWaitVerdict spProbeIndexWait(const std::string& path, IndexWaitState& st) {
     in.pendingZero = true;
     in.downloadHint = hint;
     in.hadDownloadHint = st.hadHint;
-    in.wallNowNs = spfs::wallClockNowNs();
+    struct timespec wall {};
+    clock_gettime(CLOCK_REALTIME, &wall);
+    in.wallNowNs = (int64_t)wall.tv_sec * 1000000000LL + wall.tv_nsec;
     in.monoNowUs = mono;
     in.lastGrowthUs = st.lastGrowthUs;
     in.probeStartUs = st.probeStartUs;
@@ -1636,9 +1706,9 @@ std::string Demuxer::sourceCurrentPath() const {
 void Demuxer::requestAbort() {
     abortIO_.store(true);
 
-    if (spfs::ThreadId th = openThread_.load(std::memory_order_acquire)) {
+    if (pthread_t th = openThread_.load(std::memory_order_acquire)) {
         spEnsureIOInterruptSignalInstalled();
-        spfs::interruptBlockingIo(th);
+        pthread_kill(th, SIGUSR2);
     }
 
     std::shared_ptr<AuxIOCancelToken> pc, kc;
@@ -1662,14 +1732,15 @@ void Demuxer::requestAbort() {
     { std::lock_guard<std::mutex> lk(io->growthMtx); }
     io->growthCv.notify_all();
     if (!io->inRead.load()) return;
-    spfs::interruptBlockingIo(io->ioThread.load(std::memory_order_relaxed));
+    pthread_kill(io->ioThread.load(std::memory_order_relaxed), SIGUSR2);
 
     std::weak_ptr<LocalFileIO> weak = io;
     std::thread([weak] {
-        spfs::sleepMicroseconds(100 * 1000);
+        struct timespec ts { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, nullptr);
         if (auto s = weak.lock()) {
             if (s->abortRequested.load() && s->inRead.load()) {
-                spfs::interruptBlockingIo(s->ioThread.load(std::memory_order_relaxed));
+                pthread_kill(s->ioThread.load(std::memory_order_relaxed), SIGUSR2);
             }
         }
     }).detach();
@@ -1712,9 +1783,8 @@ ReadSourceView Demuxer::captureReadSourceView() const {
         size_t got = 0;
         if (pos < io->size) {
             const size_t physicalWant = (size_t)std::min<uint64_t>(want, (uint64_t)(io->size - pos));
-            int err = 0;
-            const int64_t n = spfs::readAt(io->fd, buf, physicalWant, pos, &err);
-            if (n < 0) return AVERROR(err);
+            const ssize_t n = ::pread(io->fd, buf, physicalWant, (off_t)pos);
+            if (n < 0) return AVERROR(errno);
             got = (size_t)n;
             // A short physical read is not a virtual hole: never manufacture
             // bytes after an unexpected truncation or interrupted source read.
@@ -1765,9 +1835,8 @@ ReadSourceView Demuxer::captureOpeningReadSourceView(const std::vector<spresil::
             size_t got = 0;
             if (pos < io->size) {
                 const size_t physicalWant = static_cast<size_t>(std::min<uint64_t>(want, static_cast<uint64_t>(io->size - pos)));
-                int err = 0;
-                const int64_t n = spfs::readAt(io->fd, buf, physicalWant, pos, &err);
-                if (n < 0) return AVERROR(err);
+                const ssize_t n = ::pread(io->fd, buf, physicalWant, static_cast<off_t>(pos));
+                if (n < 0) return AVERROR(errno);
                 got = static_cast<size_t>(n);
                 if (got != physicalWant) return AVERROR(EIO);
             }
@@ -1789,14 +1858,14 @@ void Demuxer::startVolumeKeepAliveIfNeeded() {
     if (!admitAuxWorker("keepalive")) return;
     AuxWorkerReservation rsv{auxWorkers_, true};
     if (keepAliveStarted_.exchange(true)) return;
-    const spfs::Handle fd = spfs::duplicate(localIO_->fd);
-    if (!spfs::valid(fd)) return;
+    int fd = dup(localIO_->fd);
+    if (fd < 0) return;
     const int64_t size = localIO_->size;
     auto cancel = std::make_shared<AuxIOCancelToken>();
     {
 
         std::lock_guard<std::mutex> lk(ioMtx_);
-        if (abortIO_.load()) { spfs::close(fd); return; }
+        if (abortIO_.load()) { ::close(fd); return; }
         keepAliveCancel_ = cancel;
     }
     int intervalSec = 45;
@@ -1811,8 +1880,8 @@ void Demuxer::startVolumeKeepAliveIfNeeded() {
     std::thread([fd, size, cancel, intervalSec, debug, aux = auxWorkers_,
                  act = ioActivityUs_] {
         AuxWorkerScope scope(aux, /*adoptReservation=*/true);
-        spfs::setCurrentThreadName("sp.demux.keepalive");
-        spfs::setCurrentThreadQos(spfs::ThreadQos::Background);
+        pthread_setname_np("sp.demux.keepalive");
+        pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
         uint64_t lcg = 0x9E3779B97F4A7C15ULL ^ (uint64_t)fd;
         char buf[4096];
         if (debug) fprintf(stderr, "[DemuxIO] 保活启动（远端卷，每 %ds）\n", intervalSec);
@@ -1835,13 +1904,13 @@ void Demuxer::startVolumeKeepAliveIfNeeded() {
             int64_t maxOff = size > (int64_t)sizeof(buf) ? size - (int64_t)sizeof(buf) : 0;
             int64_t off = maxOff > 0 ? (int64_t)(lcg % (uint64_t)maxOff) : 0;
             int64_t t0 = spNowUs();
-            int64_t n = spAuxPread(*cancel, fd, buf, sizeof(buf), off);
+            ssize_t n = spAuxPread(*cancel, fd, buf, sizeof(buf), off);
             if (debug) {
                 fprintf(stderr, "[DemuxIO] 保活触达 off=%.1fGB %.0fms%s\n",
                         off / 1e9, (spNowUs() - t0) / 1000.0, n <= 0 ? "（读失败）" : "");
             }
         }
-        spfs::close(fd);
+        ::close(fd);
     }).detach();
 }
 
@@ -1855,7 +1924,7 @@ struct ScrubShared {
     std::atomic<uint64_t> taskSeq{0};
     std::atomic<uint64_t> activeSeq{0};
     std::atomic<bool> stop{false};
-    spfs::Handle fd = spfs::kInvalidHandle;
+    int fd = -1;
     std::string path;
     AVFormatContext* shadowCtx = nullptr;
     int shadowVideoStream = -1;
@@ -1962,22 +2031,22 @@ void Demuxer::ensureScrubWorker() {
     if (!localIO_) return;
     if (!admitAuxWorker("scrub")) return;
     AuxWorkerReservation rsv{auxWorkers_, true};
-    const spfs::Handle fd = spfs::duplicate(localIO_->fd);
-    if (!spfs::valid(fd)) return;
+    int fd = dup(localIO_->fd);
+    if (fd < 0) return;
     auto st = std::make_shared<ScrubShared>();
     st->fd = fd;
     st->path = path_;
     {
 
         std::lock_guard<std::mutex> lk(ioMtx_);
-        if (abortIO_.load()) { spfs::close(fd); return; }
+        if (abortIO_.load()) { ::close(fd); return; }
         scrub_ = st;
     }
     rsv.handOff();
     std::thread([st, aux = auxWorkers_] {
         AuxWorkerScope scope(aux, /*adoptReservation=*/true);
-        spfs::setCurrentThreadName("sp.demux.scrub-prefetch");
-        spfs::setCurrentThreadQos(spfs::ThreadQos::Utility);
+        pthread_setname_np("sp.demux.scrub-prefetch");
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 
         std::vector<uint8_t> scratchBuf[2];
         scratchBuf[0].resize(256 * 1024);
@@ -2037,7 +2106,7 @@ void Demuxer::ensureScrubWorker() {
             if (jobCount > 1) {
                 std::thread helper([&] {
                     AuxWorkerScope helperScope(aux);
-                    spfs::setCurrentThreadQos(spfs::ThreadQos::Utility);
+                    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
                     consume(1);
                 });
                 consume(0);
@@ -2049,7 +2118,7 @@ void Demuxer::ensureScrubWorker() {
         }
         lk.unlock();
         if (st->shadowCtx) avformat_close_input(&st->shadowCtx);
-        spfs::close(st->fd);
+        ::close(st->fd);
     }).detach();
 }
 
@@ -2217,8 +2286,8 @@ void Demuxer::prefetchIndexRegionAsync() {
     if (!admitAuxWorker("index-prefetch")) return;
     AuxWorkerReservation rsv{auxWorkers_, true};
 
-    const spfs::Handle fd = spfs::duplicate(localIO_->fd);
-    if (!spfs::valid(fd)) return;
+    int fd = dup(localIO_->fd);
+    if (fd < 0) return;
     auto cancel = std::make_shared<AuxIOCancelToken>();
     auto completed = std::make_shared<std::atomic<bool>>(false);
     {
@@ -2227,11 +2296,11 @@ void Demuxer::prefetchIndexRegionAsync() {
         if (abortIO_.load() ||
             indexPrefetchBlocked_.load(std::memory_order_acquire) ||
             prefetchDeferSeq_.load(std::memory_order_relaxed) != deferSeqAtEntry) {
-            spfs::close(fd);
+            ::close(fd);
             return;
         }
         if (prefetchIssued_.exchange(true)) {
-            spfs::close(fd);
+            ::close(fd);
             return;
         }
         prefetchCancel_ = cancel;
@@ -2248,19 +2317,18 @@ void Demuxer::prefetchIndexRegionAsync() {
     std::thread([fd, size, cancel, completed, debug, tsLike,
                  noCuesParse = noCuesParse, aux = auxWorkers_] {
         AuxWorkerScope scope(aux, /*adoptReservation=*/true);
-        spfs::setCurrentThreadName("sp.demux.index-prefetch");
+        pthread_setname_np("sp.demux.index-prefetch");
 
-        spfs::setCurrentThreadQos(spfs::ThreadQos::Utility);
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
         // QoS only influences CPU scheduling. The actual contention here is
-        // disk/SMB I/O, so place this worker in the throttled disk tier as
-        // well: setiopolicy_np for the thread on Darwin, the I/O priority
-        // hint on this worker's own handle on Windows. Failure merely leaves
-        // the existing utility-QoS behaviour.
-        spfs::lowerReadPriority(fd);
-        int policyError = 0;
-        if (!spfs::throttleCurrentThreadDiskIo(&policyError) && debug) {
+        // disk/SMB I/O, so place this worker in Darwin's throttled disk tier as
+        // well. This API has existed since macOS 10.5 (deployment target is
+        // 14); failure merely leaves the existing utility-QoS behaviour.
+        const int policyResult =
+            setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE);
+        if (policyResult != 0 && debug) {
             fprintf(stderr, "[DemuxIO] 索引预热 I/O 降优先级失败: %s\n",
-                    strerror(policyError));
+                    strerror(errno));
         }
         int64_t t0 = spNowUs();
         constexpr int64_t kChunk = 1 * 1024 * 1024;
@@ -2271,7 +2339,7 @@ void Demuxer::prefetchIndexRegionAsync() {
         auto warm = [&](int64_t off, int64_t len) {
             for (int64_t p = off; p < off + len && p < size; p += kChunk) {
                 if (cancel->cancel.load()) return;
-                int64_t n = spAuxPread(*cancel, fd, scratch.data(), (size_t)kChunk, p);
+                ssize_t n = spAuxPread(*cancel, fd, scratch.data(), (size_t)kChunk, p);
                 if (n <= 0) return;
                 got += (uint64_t)n;
             }
@@ -2280,8 +2348,8 @@ void Demuxer::prefetchIndexRegionAsync() {
         int64_t cuesOff = -1, cuesLen = 0;
         if (!tsLike) {
             const size_t headWant = (size_t)(size < kHead ? size : kHead);
-            int64_t hn = spAuxPread(*cancel, fd, scratch.data(), headWant, 0);
-            if (hn <= 0) { spfs::close(fd); return; }
+            ssize_t hn = spAuxPread(*cancel, fd, scratch.data(), headWant, 0);
+            if (hn <= 0) { ::close(fd); return; }
             got += (uint64_t)hn;
 
             if (!noCuesParse) {
@@ -2292,7 +2360,7 @@ void Demuxer::prefetchIndexRegionAsync() {
 
                     constexpr size_t kSeekHeadWant = 64 * 1024;
                     std::vector<uint8_t> sh(kSeekHeadWant);
-                    int64_t sn = spAuxPread(*cancel, fd, sh.data(), kSeekHeadWant,
+                    ssize_t sn = spAuxPread(*cancel, fd, sh.data(), kSeekHeadWant,
                                             scan.seekHeadOffset);
                     if (sn > 0) {
                         got += (uint64_t)sn;
@@ -2304,7 +2372,7 @@ void Demuxer::prefetchIndexRegionAsync() {
                     !cancel->cancel.load()) {
 
                     uint8_t hdr[32];
-                    int64_t cn = spAuxPread(*cancel, fd, hdr, sizeof(hdr), scan.cuesOffset);
+                    ssize_t cn = spAuxPread(*cancel, fd, hdr, sizeof(hdr), scan.cuesOffset);
                     if (cn > 0) {
                         got += (uint64_t)cn;
                         const int64_t len = spMatroskaCuesElementLength(hdr, (size_t)cn);
@@ -2340,7 +2408,7 @@ void Demuxer::prefetchIndexRegionAsync() {
                         (spNowUs() - t0) / 1000.0, cancel->cancel.load() ? "（被中断）" : "");
             }
         }
-        spfs::close(fd);
+        ::close(fd);
     }).detach();
 }
 
@@ -2558,13 +2626,13 @@ int Demuxer::analyzeInputOnce(size_t* pgsFilled) {
 int Demuxer::open(const std::string& path, bool analyze) {
     close();
     abortIO_.store(false);
-    openThread_.store(spfs::currentThreadId(), std::memory_order_release);
+    openThread_.store(pthread_self(), std::memory_order_release);
     struct ClearOpenThread {
-        std::atomic<spfs::ThreadId>& t;
+        std::atomic<pthread_t>& t;
         std::shared_ptr<LocalFileIO>& source;
         ~ClearOpenThread() {
             if (source) source->openingViewActive.store(false, std::memory_order_release);
-            source.reset(); t.store(0, std::memory_order_release);
+            source.reset(); t.store(nullptr, std::memory_order_release);
         }
     } clearOpenThread{openThread_, openingSource_};
     indexPrefetchBlocked_.store(false, std::memory_order_release);
@@ -3216,11 +3284,10 @@ int Demuxer::alternateVideoStream(int excluding) const {
 bool Demuxer::openSourceIdentity(uint64_t& dev, uint64_t& ino, int64_t& size, int64_t& mtimeNs) const {
     const auto io = ioSnapshot();
     if (!io) return false;
-    // Same mapping as sptrial::captureSource, so the two can be compared.
-    dev = io->sourceId.volume;
-    ino = io->sourceId.fileLow;
+    dev = (uint64_t)io->sourceDev;
+    ino = (uint64_t)io->sourceIno;
     size = io->size;
-    mtimeNs = io->sourceMtimeNs;
+    mtimeNs = (int64_t)io->sourceMtime.tv_sec * 1000000000ll + io->sourceMtime.tv_nsec;
     return true;
 }
 
@@ -3781,7 +3848,7 @@ bool Demuxer::attemptAviChunkSizeRecovery(int64_t lostTsUs, const std::string& w
 bool Demuxer::tsRangeHasZeroFill(int64_t posA, int64_t posB) {
     if (posA < 0 || posB <= posA) return false;
     const std::shared_ptr<LocalFileIO> io = ioSnapshot();
-    if (!io || !spfs::valid(io->fd) || abortIO_.load()) return false;
+    if (!io || io->fd < 0 || abortIO_.load()) return false;
     const int64_t end = std::min<int64_t>(posB, posA + 64ll * 1024 * 1024);
     struct Scan { bool zero = false; };
     Scan scan;
@@ -3790,10 +3857,9 @@ bool Demuxer::tsRangeHasZeroFill(int64_t posA, int64_t posB) {
         uint8_t buf[188];
         for (int64_t pos = posA; pos + 188 <= end; pos += 64 * 1024) {
             if (cancel.load(std::memory_order_acquire) || io->abortRequested.load()) break;
-            int64_t got;
-            int err = 0;
-            do { got = spfs::readAt(io->fd, buf, sizeof(buf), pos, &err); } while (got < 0 && err == EINTR && !io->abortRequested.load());
-            if (got == (int64_t)sizeof(buf) && spresil::allZero(buf, sizeof(buf))) { r.zero = true; break; }
+            ssize_t got;
+            do { got = ::pread(io->fd, buf, sizeof(buf), (off_t)pos); } while (got < 0 && errno == EINTR && !io->abortRequested.load());
+            if (got == (ssize_t)sizeof(buf) && spresil::allZero(buf, sizeof(buf))) { r.zero = true; break; }
         }
         return r;
     }, scan);
@@ -3822,7 +3888,7 @@ int64_t Demuxer::tsPcrDeltaUs(int streamIndex, int64_t posA, int64_t posB) {
     }
 
     const std::shared_ptr<LocalFileIO> io = ioSnapshot();
-    if (!io || !spfs::valid(io->fd) || io->size <= 0 || abortIO_.load()) return -1;
+    if (!io || io->fd < 0 || io->size <= 0 || abortIO_.load()) return -1;
     if (posB > posA && posB - posA > (io->remote ? 16ll * 1024 * 1024 : 256ll * 1024 * 1024)) return -1;
     struct Scan { int64_t out = -1; uint64_t reads = 0, bytes = 0, us = 0; };
     const int64_t size = io->size;
@@ -3834,10 +3900,9 @@ int64_t Demuxer::tsPcrDeltaUs(int streamIndex, int64_t posA, int64_t posB) {
         const spresil::Reader read = [&io, &r, count](int64_t pos, uint8_t* buf, size_t n) -> int64_t {
             if (pos < 0 || io->abortRequested.load()) return AVERROR_EXIT;
             const int64_t t0 = count ? spNowUs() : 0;
-            int64_t got;
-            int err = 0;
-            do { got = spfs::readAt(io->fd, buf, n, pos, &err); } while (got < 0 && err == EINTR && !io->abortRequested.load());
-            const int64_t result = got < 0 ? (int64_t)AVERROR(err) : got;
+            ssize_t got;
+            do { got = ::pread(io->fd, buf, n, (off_t)pos); } while (got < 0 && errno == EINTR && !io->abortRequested.load());
+            const int64_t result = got < 0 ? (int64_t)AVERROR(errno) : (int64_t)got;
             if (count) { ++r.reads; if (got > 0) r.bytes += (uint64_t)got; r.us += (uint64_t)(spNowUs() - t0); }
             return result;
         };
@@ -4094,7 +4159,7 @@ int Demuxer::growthRefreshOnStructuralEof() {
     for (;;) {
         if (aborted()) { leaveWait(); return AVERROR_EXIT; }
         if (io->growthYield && *io->growthYield && (*io->growthYield)()) { leaveWait(); return AVERROR_EXIT; }
-        spfs::FileStat sb {};
+        struct stat sb {};
         int statErrno = 0;
         std::string path;
         bool aria2 = false;
@@ -4385,7 +4450,7 @@ int Demuxer::readPacket(AVPacket* pkt) {
         }
     }
 
-    if (psLike_ && resilientRecoveryEnabled_ && localIO_ && spfs::valid(localIO_->fd) && pkt->stream_index == videoStream_ && pkt->pos >= 0 &&
+    if (psLike_ && resilientRecoveryEnabled_ && localIO_ && localIO_->fd >= 0 && pkt->stream_index == videoStream_ && pkt->pos >= 0 &&
         psPesAttempts_ < 16 && !abortIO_.load()) {
         const int64_t fsz = localIO_->size;
         const spresil::Reader raw = localRawReader();
@@ -4439,7 +4504,7 @@ int Demuxer::readPacket(AVPacket* pkt) {
         }
     }
 
-    if (asfLike_ && resilientRecoveryEnabled_ && localIO_ && spfs::valid(localIO_->fd) && pkt->pos >= 0 && pkt->pos != asfLastCheckedPacketPos_ &&
+    if (asfLike_ && resilientRecoveryEnabled_ && localIO_ && localIO_->fd >= 0 && pkt->pos >= 0 && pkt->pos != asfLastCheckedPacketPos_ &&
         pkt->pos >= asfCountScannedUntil_ && fmtCtx_->packet_size > 0 && fmtCtx_->packet_size <= 65536 && !abortIO_.load()) {
         const int64_t psz = fmtCtx_->packet_size;
 
@@ -4472,12 +4537,12 @@ int Demuxer::readPacket(AVPacket* pkt) {
         }
     }
 
-    if (tsMpegTs_ && resilientRecoveryEnabled_ && localIO_ && spfs::valid(localIO_->fd) && pkt->pos >= 0 && tsHdrAttempts_ < 8 && !abortIO_.load() &&
+    if (tsMpegTs_ && resilientRecoveryEnabled_ && localIO_ && localIO_->fd >= 0 && pkt->pos >= 0 && tsHdrAttempts_ < 8 && !abortIO_.load() &&
         (videoStream_ < 0 || pkt->stream_index == videoStream_) && attemptTsTransportRecovery(pkt->pos)) {
         if (rereadAfterRecovery(pkt, ret)) return ret;
     }
 
-    if (resilientRecoveryEnabled_ && localIO_ && spfs::valid(localIO_->fd) && !abortIO_.load()) {
+    if (resilientRecoveryEnabled_ && localIO_ && localIO_->fd >= 0 && !abortIO_.load()) {
         bool recovered = false;
         const int64_t errPos = audioErrPosMailbox_.exchange(-1, std::memory_order_relaxed);
         if (errPos >= 0 && attemptMkvFlacLacingRecovery(errPos)) recovered = true;
@@ -4622,9 +4687,9 @@ std::vector<Demuxer::RecoveryEvent> Demuxer::takeRecoveryEvents() {
 }
 
 static bool spLocalSourceAppendOnly(const LocalFileIO& io) {
-    spfs::FileStat sb {};
-    return spfs::valid(io.fd) && spfs::stat(io.fd, &sb) && sb.regular && sb.identity == io.sourceId &&
-           sb.size >= io.size;
+    struct stat sb {};
+    return io.fd >= 0 && fstat(io.fd, &sb) == 0 && S_ISREG(sb.st_mode) && sb.st_dev == io.sourceDev &&
+           sb.st_ino == io.sourceIno && sb.st_size >= io.size;
 }
 
 static spresil::Reader spOpenPlanCachedReader(spresil::Reader base) {
@@ -4666,7 +4731,7 @@ bool Demuxer::withFileReader(const std::string& path, const std::function<void(c
     // independent of both AVIO and its worker. Do not adopt changed file data.
     const bool count = spDebug();
     const auto live = localIO_;
-    if (live && spfs::valid(live->fd) && !onOpenThread()) {
+    if (live && live->fd >= 0 && !onOpenThread()) {
 
         if (abortIO_.load()) return false;
         fn(abandonableReader(live, count ? &planIO_ : nullptr), live->size);
@@ -4681,27 +4746,25 @@ bool Demuxer::withFileReader(const std::string& path, const std::function<void(c
             if (abortIO_.load()) return AVERROR_EXIT;
             if (pos < 0 || n > static_cast<uint64_t>(INT64_MAX - pos)) return AVERROR(EINVAL);
             const int64_t t0 = count ? spNowUs() : 0;
-            int err = 0;
-            const int64_t got = spfs::readAt(source->fd, buf, n, pos, &err);
+            const ssize_t got = ::pread(source->fd, buf, n, static_cast<off_t>(pos));
             if (count) notePlanRead(got, spNowUs() - t0);
-            return got < 0 ? static_cast<int64_t>(AVERROR(err)) : got;
+            return got < 0 ? static_cast<int64_t>(AVERROR(errno)) : static_cast<int64_t>(got);
         };
         fn(spOpenPlanCachedReader(std::move(reader)), source->size);
         return !abortIO_.load() && sourceOk();
     }
-    const spfs::Handle fd = spfs::openForRead(path);
-    if (!spfs::valid(fd)) return false;
-    spfs::FileStat sb {};
-    if (!spfs::stat(fd, &sb) || !sb.regular) { spfs::close(fd); return false; }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat sb {};
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) { ::close(fd); return false; }
     spresil::Reader reader = [this, fd, count](int64_t pos, uint8_t* buf, size_t n) -> int64_t {
         const int64_t t0 = count ? spNowUs() : 0;
-        int err = 0;
-        const int64_t got = spfs::readAt(fd, buf, n, pos, &err);
+        const ssize_t got = ::pread(fd, buf, n, (off_t)pos);
         if (count) notePlanRead(got, spNowUs() - t0);
-        return got < 0 ? (int64_t)AVERROR(err) : got;
+        return got < 0 ? (int64_t)AVERROR(errno) : (int64_t)got;
     };
-    fn(spOpenPlanCachedReader(std::move(reader)), sb.size);
-    spfs::close(fd);
+    fn(spOpenPlanCachedReader(std::move(reader)), (int64_t)sb.st_size);
+    ::close(fd);
     return true;
 }
 
@@ -5187,7 +5250,8 @@ void Demuxer::mkvContentStartJob() {
     auto job = std::make_shared<MkvContentScanJob>();
     job->path = sourceCurrentPath();
     if (job->path.empty()) job->path = path_;
-    job->sourceId = localIO_->sourceId;
+    job->dev = localIO_->sourceDev;
+    job->ino = localIO_->sourceIno;
     job->size = localIO_->size;
     job->remote = remoteVolume_.load(std::memory_order_relaxed);
     job->kind = (uint8_t)mkvContent_.kind;
@@ -5251,25 +5315,24 @@ void Demuxer::mkvContentCancelJob() {
 
 void spRunMkvContentScan(MkvContentScanJob& job, const std::function<void(std::vector<std::pair<int64_t, int64_t>>)>& progress) {
     if (job.cancelled.load() || !job.map) return;
-    const spfs::Handle fd = spfs::openForRead(job.path);
-    if (!spfs::valid(fd)) return;
-    spfs::FileStat sb {};
-    if (!spfs::stat(fd, &sb) || !sb.regular || !(sb.identity == job.sourceId) || sb.size != job.size) {
-        spfs::close(fd);
+    const int fd = ::open(job.path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat sb {};
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_dev != job.dev || sb.st_ino != job.ino || sb.st_size != job.size) {
+        ::close(fd);
         return;
     }
     const int64_t fsz = job.size;
     int64_t bytes = 0;
     const spresil::Reader read = [&](int64_t pos, uint8_t* buf, size_t n) -> int64_t {
-        for (int spins = 0; job.yield.load(std::memory_order_relaxed) > 0 && !job.cancelled.load() && spins < 3000; ++spins) spfs::sleepMicroseconds(10000);
+        for (int spins = 0; job.yield.load(std::memory_order_relaxed) > 0 && !job.cancelled.load() && spins < 3000; ++spins) usleep(10000);
         if (job.cancelled.load()) return AVERROR_EXIT;
         if (pos < 0 || n > static_cast<uint64_t>(INT64_MAX - pos)) return AVERROR(EINVAL);
-        int err = 0;
-        const int64_t got = spfs::readAt(fd, buf, n, pos, &err);
+        const ssize_t got = ::pread(fd, buf, n, (off_t)pos);
         if (got > 0) bytes += got;
 
-        if (job.remote && got > 0) spfs::sleepMicroseconds(std::min<int64_t>(200000, got * 1000000 / (32ll * 1024 * 1024)));
-        return got < 0 ? (int64_t)AVERROR(err) : got;
+        if (job.remote && got > 0) usleep((useconds_t)std::min<int64_t>(200000, got * 1000000 / (32ll * 1024 * 1024)));
+        return got < 0 ? (int64_t)AVERROR(errno) : (int64_t)got;
     };
     spresil::MkvContentMap local;
     {
@@ -5325,7 +5388,7 @@ void spRunMkvContentScan(MkvContentScanJob& job, const std::function<void(std::v
         job.version.fetch_add(1, std::memory_order_release);
         progress(spansUs());
     }
-    spfs::close(fd);
+    ::close(fd);
     if (spDebug()) {
         fprintf(stderr, "[Demux] 内容地图：后台预扫%s %.1fs 读 %.1fMB 探测 %d 次 → 孤岛 %zu\n", ok ? "完成" : "中止", (spNowUs() - t0) / 1e6,
                 bytes / 1048576.0, local.probes, local.islands.size());
@@ -5942,7 +6005,7 @@ void Demuxer::releaseLaneScratch() {
 
 bool Demuxer::evidenceSourceUnchanged() {
     const std::shared_ptr<LocalFileIO> io = localIO_;
-    if (!io || !spfs::valid(io->fd)) return false;
+    if (!io || io->fd < 0) return false;
     if (onOpenThread()) return spLocalSourceUnchanged(*io);
     bool unchanged = false;
     const bool ran = spRunAbandonable(io, "sp.src-ident", [io](const std::atomic<bool>&) { return spLocalSourceUnchanged(*io); }, unchanged);
@@ -6604,7 +6667,7 @@ bool Demuxer::attemptTsTransportRecovery(int64_t untilPos, bool flush) {
 }
 
 void Demuxer::verifyMp4SeekRap(int64_t absUs, int streamIndex, bool forwardKeyframe, int& ret) {
-    if (ret < 0 || !resilientRecoveryEnabled_ || !localIO_ || !spfs::valid(localIO_->fd) || videoStream_ < 0 || fmp4Like_ || !sampleEofRetryEligible_ || abortIO_.load()) return;
+    if (ret < 0 || !resilientRecoveryEnabled_ || !localIO_ || localIO_->fd < 0 || videoStream_ < 0 || fmp4Like_ || !sampleEofRetryEligible_ || abortIO_.load()) return;
     AVStream* st = fmtCtx_->streams[videoStream_];
     const AVCodecParameters* par = st->codecpar;
     const bool hevc = par->codec_id == AV_CODEC_ID_HEVC;
@@ -6727,7 +6790,7 @@ void Demuxer::tryMp4CttsRecovery() {
         catch (...) { cttsTrial_.reset(); if (spDebug()) fprintf(stderr, "[Demux] ctts 私有试解线程启动失败：不试\n"); }
     };
     launch([trial, plan, path, vi, cid, first, last, patchOffset, newValue, detail] {
-        spfs::setCurrentThreadName("sp.ctts-trial");
+        pthread_setname_np("sp.ctts-trial");
         struct Finish { std::shared_ptr<Mp4CttsTrial> t; ~Finish() { t->done.store(true, std::memory_order_release); } } finish{trial};
         if (const int64_t stallUs = spAuxStallUs()) spSleepUninterruptible(stallUs);
 
@@ -7223,7 +7286,7 @@ spresil::TsByteSource Demuxer::tsLaneSource(const spresil::Reader& rd, int64_t s
 bool Demuxer::flacLastFrameEndSample(const uint8_t* streamInfo, size_t n, uint64_t& endSample) {
     spresil::FlacStreamInfo info;
     const std::shared_ptr<LocalFileIO> io = localIO_;
-    if (!fmtCtx_ || !io || !spfs::valid(io->fd) || io->size <= 0 || container_ != "flac" || abortIO_.load() ||
+    if (!fmtCtx_ || !io || io->fd < 0 || io->size <= 0 || container_ != "flac" || abortIO_.load() ||
         !spresil::flacParseStreamInfo(streamInfo, n, info)) return false;
 
     const int64_t size = io->size;
@@ -7245,7 +7308,7 @@ bool Demuxer::flacLastFrameEndSample(const uint8_t* streamInfo, size_t n, uint64
 }
 
 bool Demuxer::withLocalReader(const std::function<void(const spresil::Reader&, int64_t)>& fn) {
-    if (!localIO_ || !spfs::valid(localIO_->fd) || localIO_->size <= 0) return withFileReader(path_, fn);
+    if (!localIO_ || localIO_->fd < 0 || localIO_->size <= 0) return withFileReader(path_, fn);
     const bool count = spDebug();
     if (!onOpenThread()) {
 
@@ -7254,13 +7317,12 @@ bool Demuxer::withLocalReader(const std::function<void(const spresil::Reader&, i
         fn(abandonableReader(io, count ? &laneIO_ : nullptr), io->size);
         return !abortIO_.load();
     }
-    const spfs::Handle fd = localIO_->fd;
+    const int fd = localIO_->fd;
     const spresil::Reader reader = [this, fd, count](int64_t pos, uint8_t* buf, size_t n) -> int64_t {
         const int64_t t0 = count ? spNowUs() : 0;
-        int err = 0;
-        const int64_t got = spfs::readAt(fd, buf, n, pos, &err);
+        const ssize_t got = ::pread(fd, buf, n, (off_t)pos);
         if (count) noteIORead(laneIO_, got, spNowUs() - t0);
-        return got < 0 ? (int64_t)AVERROR(err) : got;
+        return got < 0 ? (int64_t)AVERROR(errno) : (int64_t)got;
     };
     fn(reader, localIO_->size);
     return true;
@@ -7269,11 +7331,10 @@ bool Demuxer::withLocalReader(const std::function<void(const spresil::Reader&, i
 spresil::Reader Demuxer::localRawReader() {
     const std::shared_ptr<LocalFileIO> io = localIO_;
     if (!onOpenThread()) return abandonableReader(io, nullptr);
-    const spfs::Handle fd = io->fd;
+    const int fd = io->fd;
     return [fd](int64_t pos, uint8_t* buf, size_t n) -> int64_t {
-        int err = 0;
-        const int64_t got = spfs::readAt(fd, buf, n, pos, &err);
-        return got < 0 ? (int64_t)AVERROR(err) : got;
+        const ssize_t got = ::pread(fd, buf, n, (off_t)pos);
+        return got < 0 ? (int64_t)AVERROR(errno) : (int64_t)got;
     };
 }
 

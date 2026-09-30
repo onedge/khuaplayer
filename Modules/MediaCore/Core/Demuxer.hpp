@@ -14,8 +14,6 @@
 #include <vector>
 
 #include "TsRapPolicy.hpp"
-#include "Platform/SPFileSystem.hpp"
-#include "Platform/SPThread.hpp"
 #include "SPResilience.hpp"
 #include "Recovery/RecoveryTypes.hpp"
 #include "SPReadSourceView.hpp"
@@ -65,7 +63,8 @@ std::vector<std::pair<int64_t, int64_t>> spRunPendingScan(PendingScanJob& job);
 
 struct MkvContentScanJob {
     std::string path;
-    spfs::FileIdentity sourceId;
+    dev_t dev = 0;
+    ino_t ino = 0;
     int64_t size = 0;
     bool remote = false;
     uint8_t kind = 0;                          // ContentKind：1 Mkv / 2 Ts / 3 Mp4
@@ -180,7 +179,6 @@ public:
 
     int64_t timelineOriginUs() const { return timelineOriginUs_; }
 
-    // > 0: a packet was read into pkt. 0: end of file. < 0: an AVERROR code.
     int readPacket(AVPacket* pkt);
 
     bool lastPacketIsReplay() const { return lastPacketReplay_; }
@@ -380,7 +378,7 @@ private:
     std::atomic<bool> abortIO_{false};
     const spresil::AbortFn abortFn_ = [this] { return abortIO_.load(); };
 
-    std::atomic<spfs::ThreadId> openThread_{0};
+    std::atomic<pthread_t> openThread_{nullptr};
     std::atomic<int64_t> durationUs_{0};
     int64_t timelineOriginUs_ = 0;
 
@@ -541,7 +539,7 @@ private:
                         bool tolerateAppend = false);
     bool withLocalReader(const std::function<void(const spresil::Reader&, int64_t)>& fn);
 
-    bool onOpenThread() const { return openThread_.load(std::memory_order_acquire) == spfs::currentThreadId(); }
+    bool onOpenThread() const { return openThread_.load(std::memory_order_acquire) == pthread_self(); }
 
     static constexpr int64_t kRemoteScanCap = 4ll * 1024 * 1024;
     int64_t scanCap(int64_t localCap, int64_t remoteCap = kRemoteScanCap) const {

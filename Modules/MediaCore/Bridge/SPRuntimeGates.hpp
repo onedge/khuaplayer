@@ -1,21 +1,14 @@
 // Shared runtime gates and monotonic clock for the media core.
 // Debug logging is cached and remains available in store builds. Behavior-
 // changing automation is compiled out of that lane, including each hook body.
-// The clock returns CLOCK_UPTIME_RAW microseconds on Apple platforms and
-// steady_clock (QueryPerformanceCounter) microseconds elsewhere; unlike
-// CLOCK_UPTIME_RAW, the latter keeps counting while the machine sleeps. The full
-// feature tier starts at macOS 26; individual system APIs still require their
-// own availability checks. Other platforms never report the full tier.
+// The clock returns CLOCK_UPTIME_RAW microseconds. The full feature tier starts
+// at macOS 26; individual system APIs still require their own availability checks.
 #pragma once
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#if defined(__APPLE__)
 #include <time.h>
-#else
-#include <chrono>
-#endif
 
 static inline bool spDebug() {
     static const bool on = getenv("SP_DEBUG") != nullptr;
@@ -32,12 +25,7 @@ static inline bool spAutomation() {
 }
 
 static inline int64_t spNowUs() {
-#if defined(__APPLE__)
     return (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
-#else
-    return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-#endif
 }
 
 static inline bool spFullTier() {
@@ -48,9 +36,7 @@ static inline bool spFullTier() {
             if (t && strcmp(t, "compat") == 0) return false;
         }
 #endif
-#if defined(__APPLE__)
         if (__builtin_available(macOS 26.0, *)) return true;
-#endif
         return false;
     }();
     return full;
