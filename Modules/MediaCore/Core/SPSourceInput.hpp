@@ -4,6 +4,7 @@
 
 #include "SPReadSourceView.hpp"
 #include "SPTrialDecode.hpp"
+#include "Platform/SPErrno.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <limits>
