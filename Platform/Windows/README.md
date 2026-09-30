@@ -62,7 +62,7 @@ re-copying the patch.
 |---|---|
 | 55 `Core/` and `Bridge/` headers | Each compiles on its own under clang-cl (`khua_header_check`) |
 | `TsRapScan.cpp`, `SPDoviRPU.cpp`, `SPFrameSelectionPolicy.cpp`, `SPSubtitleCompositor.cpp` | In `khua_media_portable` |
-| `Core/Platform/SPFileSystem*` | `statPath` and `openForReading`, POSIX and Win32 (UTF-16 paths, full sharing so downloads can continue and be renamed). Grows with the Demuxer port. Paths beyond `MAX_PATH` need the app's `longPathAware` manifest setting |
-| `Core/Demuxer.cpp` | Not yet: file I/O uses `pread`, `fstatfs`, `F_GETPATH`, `proc_pidinfo` and `SIGUSR2` to interrupt blocking reads. Needs a platform file-source interface |
+| `Core/Platform/SPFileSystem*`, `SPThread*` | File handles, positional reads, stat, current path, local/remote volume, sparse ranges, writer detection, thread names and priorities, disk I/O throttling, and interrupting a blocked read (SIGUSR2 on macOS, `CancelSynchronousIo` on Windows). Errors are errno values on both. Paths beyond `MAX_PATH` need the app's `longPathAware` manifest setting |
+| `Core/Demuxer.cpp` | In `khua_media_portable`; all OS access goes through spfs. `DemuxerTests` open, read and seek a WAV with a Korean name. Windows handles are overlapped, so the reader, prefetch and scrub threads never queue behind one another, and an interrupt cancels the pending read with `CancelIoEx` |
 | `SPVideoColorMetadata.hpp`, `SPAudioChannelMap.hpp`, `SPPacketDataSnapshot.hpp`, `SPMotionFrameCompatibility.hpp` | Not yet: include CoreVideo, CoreAudioTypes or Foundation |
 | `SPPlayerCore.mm` and the other Objective-C++ bridge files | Not yet: to be split into a C++ core and platform adapters |

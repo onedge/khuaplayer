@@ -1,12 +1,14 @@
 # Platform-neutral part of KhuaPlayerMediaCore. Objective-C++ bridge files and
-# Platform/macOS stay in the Xcode project. Demuxer.cpp joins this target once
-# its POSIX file I/O sits behind a platform interface.
+# Platform/macOS stay in the Xcode project.
 find_package(FFMPEG REQUIRED)
 find_package(ZLIB REQUIRED)
 
 add_library(khua_media_portable STATIC
     Core/Platform/SPFileSystemPosix.cpp
     Core/Platform/SPFileSystemWin32.cpp
+    Core/Platform/SPThreadPosix.cpp
+    Core/Platform/SPThreadWin32.cpp
+    Core/Demuxer.cpp
     Core/TsRapScan.cpp
     Bridge/SPDoviRPU.cpp
     Bridge/SPFrameSelectionPolicy.cpp

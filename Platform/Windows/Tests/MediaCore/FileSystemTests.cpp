@@ -3,11 +3,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -139,4 +143,195 @@ TEST_F(FileSystemTest, TrialSourceIdentityDetectsChanges) {
     // Same size, different first 4 KiB.
     std::fstream(path, std::ios::binary | std::ios::in | std::ios::out) << 'y';
     EXPECT_FALSE(sptrial::sourceUnchanged(id));
+}
+
+TEST_F(FileSystemTest, HandleReadsAtOffsetsLikePread) {
+    const fs::path path = write(u8"자막.srt", "0123456789");
+    int error = -1;
+    const spfs::Handle file = spfs::openForRead(utf8(path), &error);
+    ASSERT_TRUE(spfs::valid(file));
+    EXPECT_EQ(error, 0);
+
+    char buffer[4] = {};
+    EXPECT_EQ(spfs::readAt(file, buffer, 4, 6, &error), 4);
+    EXPECT_EQ(std::string(buffer, 4), "6789");
+    // Reads never move a position the next read depends on.
+    EXPECT_EQ(spfs::readAt(file, buffer, 2, 0, &error), 2);
+    EXPECT_EQ(std::string(buffer, 2), "01");
+    // Short read at the end, then 0 at and past end of file.
+    EXPECT_EQ(spfs::readAt(file, buffer, 4, 8, &error), 2);
+    EXPECT_EQ(spfs::readAt(file, buffer, 4, 10, &error), 0);
+    EXPECT_EQ(spfs::readAt(file, buffer, 4, 1000, &error), 0);
+    EXPECT_EQ(error, 0);
+
+    spfs::FileStat byHandle, byPath;
+    ASSERT_TRUE(spfs::stat(file, &byHandle));
+    ASSERT_TRUE(spfs::statPath(utf8(path), &byPath));
+    EXPECT_EQ(byHandle.identity, byPath.identity);
+    EXPECT_EQ(byHandle.size, 10);
+    spfs::close(file);
+}
+
+TEST_F(FileSystemTest, MissingFileReportsErrno) {
+    int error = 0;
+    EXPECT_FALSE(spfs::valid(spfs::openForRead(utf8(dir_ / "missing.mkv"), &error)));
+    EXPECT_EQ(error, ENOENT);
+    spfs::FileStat st;
+    EXPECT_FALSE(spfs::statPath(utf8(dir_ / "missing.mkv"), &st, &error));
+    EXPECT_EQ(error, ENOENT);
+    EXPECT_FALSE(spfs::pathExists(utf8(dir_ / "missing.mkv")));
+}
+
+TEST_F(FileSystemTest, DuplicateOutlivesTheOriginal) {
+    const fs::path path = write(u8"a.mkv", "abc");
+    const spfs::Handle original = spfs::openForRead(utf8(path));
+    ASSERT_TRUE(spfs::valid(original));
+    const spfs::Handle copy = spfs::duplicate(original);
+    ASSERT_TRUE(spfs::valid(copy));
+    spfs::close(original);
+    char c = 0;
+    int error = 0;
+    EXPECT_EQ(spfs::readAt(copy, &c, 1, 2, &error), 1);
+    EXPECT_EQ(c, 'c');
+    spfs::close(copy);
+}
+
+TEST_F(FileSystemTest, CurrentPathFollowsRename) {
+    const fs::path partial = write(u8"영화.mkv.part", "abc");
+    const spfs::Handle file = spfs::openForRead(utf8(partial));
+    ASSERT_TRUE(spfs::valid(file));
+    EXPECT_EQ(fs::path(std::u8string(reinterpret_cast<const char8_t *>(spfs::currentPath(file).c_str()))),
+              fs::canonical(partial));
+
+    const fs::path finished = dir_ / fs::path(u8"영화.mkv");
+    fs::rename(partial, finished);
+    EXPECT_EQ(fs::path(std::u8string(reinterpret_cast<const char8_t *>(spfs::currentPath(file).c_str()))),
+              fs::canonical(finished));
+    spfs::close(file);
+}
+
+TEST_F(FileSystemTest, LocalVolumeIsNotRemote) {
+    const fs::path path = write(u8"a.mkv", "abc");
+    const spfs::Handle file = spfs::openForRead(utf8(path));
+    ASSERT_TRUE(spfs::valid(file));
+    const spfs::VolumeInfo info = spfs::volume(file);
+    EXPECT_TRUE(info.local);
+    EXPECT_FALSE(info.remote);
+    const spfs::VolumeInfo byPath = spfs::volumeOfPath(utf8(path));
+    EXPECT_EQ(byPath.local, info.local);
+    EXPECT_EQ(byPath.remote, info.remote);
+    spfs::close(file);
+}
+
+TEST_F(FileSystemTest, DenseFileIsOneAllocatedRange) {
+    const fs::path path = write(u8"dense.mkv", std::string(100000, 'x'));
+    const spfs::Handle file = spfs::openForRead(utf8(path));
+    ASSERT_TRUE(spfs::valid(file));
+    int64_t begin = -1, end = -1;
+    const int found = spfs::nextAllocatedRange(file, 0, &begin, &end);
+    if (found < 0) {
+        spfs::close(file);
+        GTEST_SKIP() << "temporary directory cannot report allocated ranges (FAT/exFAT?)";
+    }
+    ASSERT_EQ(found, 1);
+    EXPECT_EQ(begin, 0);
+    EXPECT_GE(end, 100000);
+    EXPECT_EQ(spfs::nextAllocatedRange(file, 100000, &begin, &end), 0);
+    spfs::close(file);
+}
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <winioctl.h>
+
+// A downloader that preallocates: 3 MiB sparse file with 4 KiB written at 1 MiB.
+TEST_F(FileSystemTest, SparseFileReportsItsAllocatedRange) {
+    const fs::path path = dir_ / fs::path(u8"sparse.mkv");
+    const HANDLE writer = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_NE(writer, INVALID_HANDLE_VALUE);
+    DWORD bytes = 0;
+    if (!DeviceIoControl(writer, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &bytes, nullptr)) {
+        CloseHandle(writer);
+        GTEST_SKIP() << "temporary directory does not support sparse files";
+    }
+    FILE_END_OF_FILE_INFO eof {};
+    eof.EndOfFile.QuadPart = 3 << 20;
+    ASSERT_TRUE(SetFileInformationByHandle(writer, FileEndOfFileInfo, &eof, sizeof eof));
+    const std::string block(4096, 'x');
+    OVERLAPPED at {};
+    at.Offset = 1 << 20;
+    DWORD written = 0;
+    ASSERT_TRUE(WriteFile(writer, block.data(), (DWORD)block.size(), &written, &at));
+    CloseHandle(writer);
+
+    const spfs::Handle file = spfs::openForRead(utf8(path));
+    ASSERT_TRUE(spfs::valid(file));
+    int64_t begin = -1, end = -1;
+    ASSERT_EQ(spfs::nextAllocatedRange(file, 0, &begin, &end), 1);
+    // NTFS allocates sparse files in 64 KiB units.
+    EXPECT_GT(begin, 0);
+    EXPECT_LE(begin, 1 << 20);
+    EXPECT_GE(end, (1 << 20) + 4096);
+    EXPECT_LT(end, 3 << 20);
+    EXPECT_EQ(spfs::nextAllocatedRange(file, end, &begin, &end), 0);
+    spfs::close(file);
+}
+
+TEST_F(FileSystemTest, OtherWriterIsDetectedBySharingProbe) {
+    const fs::path path = write(u8"downloading.mkv", "abc");
+    EXPECT_EQ(spfs::pathHasOtherWriter(utf8(path)), 0);
+    // Our own read handles never count as writers.
+    const spfs::Handle reader = spfs::openForRead(utf8(path));
+    ASSERT_TRUE(spfs::valid(reader));
+    EXPECT_EQ(spfs::pathHasOtherWriter(utf8(path)), 0);
+    {
+        std::ofstream writer(path, std::ios::binary | std::ios::app);
+        ASSERT_TRUE(writer.is_open());
+        EXPECT_EQ(spfs::pathHasOtherWriter(utf8(path)), 1);
+    }
+    EXPECT_EQ(spfs::pathHasOtherWriter(utf8(path)), 0);
+    spfs::close(reader);
+    EXPECT_EQ(spfs::pathHasOtherWriter(utf8(dir_ / "missing.mkv")), -1);
+}
+#endif
+
+TEST_F(FileSystemTest, DuplicateRejectsAnInvalidHandle) {
+    int error = 0;
+    EXPECT_FALSE(spfs::valid(spfs::duplicate(spfs::kInvalidHandle, &error)));
+    EXPECT_EQ(error, EBADF);
+}
+
+// The demuxer's reader, prefetch and scrub threads read one file at once.
+TEST_F(FileSystemTest, ConcurrentReadsOnOneHandleReturnTheirOwnData) {
+    std::string contents(1 << 20, '\0');
+    for (size_t i = 0; i < contents.size(); ++i) contents[i] = (char)(i * 31 / 7);
+    const fs::path path = write(u8"동시.mkv", contents);
+    const spfs::Handle file = spfs::openForRead(utf8(path));
+    ASSERT_TRUE(spfs::valid(file));
+    const spfs::Handle copy = spfs::duplicate(file);
+    ASSERT_TRUE(spfs::valid(copy));
+    spfs::lowerReadPriority(copy);
+
+    std::atomic<int> mismatches{0};
+    auto reader = [&](spfs::Handle handle, int seed) {
+        std::vector<char> buffer(4096);
+        uint32_t state = (uint32_t)seed;
+        for (int i = 0; i < 400; ++i) {
+            state = state * 1664525u + 1013904223u;
+            const int64_t offset = (int64_t)(state % (contents.size() - buffer.size()));
+            int error = 0;
+            const int64_t got = spfs::readAt(handle, buffer.data(), buffer.size(), offset, &error);
+            if (got != (int64_t)buffer.size() ||
+                std::memcmp(buffer.data(), contents.data() + offset, buffer.size()) != 0)
+                ++mismatches;
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) threads.emplace_back(reader, t % 2 ? copy : file, t + 1);
+    for (std::thread &t : threads) t.join();
+    EXPECT_EQ(mismatches.load(), 0);
+    spfs::close(copy);
+    spfs::close(file);
 }

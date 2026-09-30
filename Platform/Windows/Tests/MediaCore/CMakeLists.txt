@@ -8,6 +8,7 @@ set(KHUA_MEDIACORE_DIR ${PROJECT_SOURCE_DIR}/Modules/MediaCore)
 # once they no longer do.
 set(KHUA_PORTABLE_HEADERS
     Core/BoundedQueue.hpp
+    Core/Demuxer.hpp
     Core/MatroskaCuesLocator.hpp
     Core/SPContainerRecovery.hpp
     Core/SPGopReadback.hpp
@@ -23,6 +24,8 @@ set(KHUA_PORTABLE_HEADERS
     Core/TsRapScan.hpp
     Core/Platform/SPErrno.hpp
     Core/Platform/SPFileSystem.hpp
+    Core/Platform/SPThread.hpp
+    Core/Platform/SPWin32.hpp
     Core/Recovery/RecoveryAsfRm.hpp
     Core/Recovery/RecoveryAvi.hpp
     Core/Recovery/RecoveryBase.hpp
@@ -78,10 +81,12 @@ target_link_libraries(khua_header_check PRIVATE khua_media_portable)
 
 add_executable(khua_mediacore_tests
     AnnexBStartCodeTests.cpp
+    DemuxerTests.cpp
     FFmpegConfigurationTests.cpp
     FileSystemTests.cpp
     FrameSelectionPolicyTests.cpp
     SubtitleCompositorTests.cpp
+    ThreadTests.cpp
     TsRapPolicyTests.cpp
 )
 target_link_libraries(khua_mediacore_tests
