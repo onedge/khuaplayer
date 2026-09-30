@@ -1,6 +1,7 @@
-# Portable media-core build. The Mac app is still built by Apps/Mac/Scripts/build.sh
-# (XcodeGen); this project compiles the platform-neutral C++ sources for the
-# Windows port and for host-side unit tests. See Platform/Windows/README.md.
+# Windows build: the media core in Platform/Windows/MediaCore and its tests.
+# The Mac app is built separately by Apps/Mac/Scripts/build.sh (XcodeGen) from
+# Modules/; the Windows port keeps its own copy of the core. See
+# Platform/Windows/README.md.
 cmake_minimum_required(VERSION 3.25)
 
 project(KhuaCore LANGUAGES C CXX)
@@ -12,7 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(KHUA_BUILD_TESTS "Build portable media-core unit tests" ON)
 
-add_subdirectory(Modules/MediaCore)
+add_subdirectory(Platform/Windows/MediaCore)
 
 if(KHUA_BUILD_TESTS)
     enable_testing()

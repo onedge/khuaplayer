@@ -1,6 +1,5 @@
-// Operating-system file access for the media core, implemented for macOS by
-// SPFileSystemPosix.cpp. (The Windows port keeps its own copy under
-// Platform/Windows/MediaCore.)
+// Operating-system file access for the Windows media core, implemented by
+// SPFileSystemWin32.cpp.
 //
 // Paths are UTF-8. On Windows they are converted to UTF-16 and opened through
 // the wide-character APIs, so names outside the ANSI code page still work.

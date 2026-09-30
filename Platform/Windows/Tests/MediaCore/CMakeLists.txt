@@ -1,7 +1,7 @@
 find_package(GTest CONFIG REQUIRED)
 include(GoogleTest)
 
-set(KHUA_MEDIACORE_DIR ${PROJECT_SOURCE_DIR}/Modules/MediaCore)
+set(KHUA_MEDIACORE_DIR ${PROJECT_SOURCE_DIR}/Platform/Windows/MediaCore)
 
 # Each portable header must compile on its own. Headers that still include
 # Apple frameworks are listed in Platform/Windows/README.md and join this list
@@ -26,6 +26,7 @@ set(KHUA_PORTABLE_HEADERS
     Core/Platform/SPFileSystem.hpp
     Core/Platform/SPThread.hpp
     Core/Platform/SPWin32.hpp
+    Core/Player/SPAudioSink.hpp
     Core/Player/SPExecutor.hpp
     Core/Player/SPPlayerListener.hpp
     Core/Player/SPSync.hpp
@@ -88,6 +89,7 @@ target_link_libraries(khua_header_check PRIVATE khua_media_portable)
 
 add_executable(khua_mediacore_tests
     AnnexBStartCodeTests.cpp
+    AudioSinkTests.cpp
     ColorAndChannelTests.cpp
     DemuxerTests.cpp
     ExecutorTests.cpp
@@ -98,7 +100,6 @@ add_executable(khua_mediacore_tests
     TasksTests.cpp
     ThreadTests.cpp
     TsRapPolicyTests.cpp
-    VideoFrameBridgeTests.cpp
     VideoFrameTests.cpp
 )
 target_link_libraries(khua_mediacore_tests

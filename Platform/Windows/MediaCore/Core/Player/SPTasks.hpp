@@ -1,8 +1,7 @@
 // Background work for the media core: one-off tasks at a QoS, serial queues
 // and repeating timers. Like SPExecutor.hpp this is process-wide, so posting
-// never captures the caller. macOS installs a GCD implementation that makes
-// the calls the core made before (Platform/macOS/Player/SPDispatchExecutor.mm);
-// the Windows port keeps its own copy under Platform/Windows/MediaCore.
+// never captures the caller. Windows uses the std::thread implementation in
+// SPThreadTasks.cpp (makeThreadBackgroundTasks).
 #pragma once
 
 #include "Platform/SPThread.hpp"
@@ -77,5 +76,8 @@ void installBackgroundTasks(std::unique_ptr<BackgroundTasks> tasks);
 bool backgroundTasksInstalled();
 // The installed implementation. Using it before installation aborts.
 BackgroundTasks &backgroundTasks();
+
+// The portable std::thread implementation (SPThreadTasks.cpp).
+std::unique_ptr<BackgroundTasks> makeThreadBackgroundTasks();
 
 } // namespace sp

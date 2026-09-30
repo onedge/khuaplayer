@@ -1,6 +1,6 @@
-// Thread and clock facilities for the media core, implemented for macOS by
-// SPThreadPosix.cpp. (The Windows port keeps its own copy under
-// Platform/Windows/MediaCore.)
+// Thread and clock facilities for the Windows media core, implemented by
+// SPThreadWin32.cpp. ThreadQos keeps the Darwin QoS names the player logic
+// was written with; SPThreadWin32.cpp maps them to thread priorities.
 #pragma once
 
 #include <cstdint>

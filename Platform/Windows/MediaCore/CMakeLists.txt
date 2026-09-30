@@ -1,17 +1,16 @@
-# Platform-neutral part of KhuaPlayerMediaCore. Objective-C++ bridge files and
-# Platform/macOS stay in the Xcode project.
+# The Windows media core. Core/ and Bridge/ started as copies of the portable
+# part of Modules/MediaCore and are now maintained here, independently of the
+# Mac app, which keeps its own code under Modules/. See ../README.md.
 find_package(FFMPEG REQUIRED)
 find_package(ZLIB REQUIRED)
 
 add_library(khua_media_portable STATIC
-    Core/Platform/SPFileSystemPosix.cpp
     Core/Platform/SPFileSystemWin32.cpp
-    Core/Platform/SPThreadPosix.cpp
     Core/Platform/SPThreadWin32.cpp
-    Core/Demuxer.cpp
     Core/Player/SPExecutor.cpp
     Core/Player/SPTasks.cpp
     Core/Player/SPThreadTasks.cpp
+    Core/Demuxer.cpp
     Core/TsRapScan.cpp
     Bridge/SPDoviRPU.cpp
     Bridge/SPFrameSelectionPolicy.cpp

@@ -1,14 +1,30 @@
 # Windows port — work in progress
 
 Khua for Windows is planned as a WinUI 3 (C#) app over a C++ media-core DLL,
-x64 only. Nothing here produces a runnable app yet. The Mac app remains the
-shipping product and must keep building and playing at every commit.
+x64 only. Nothing here produces a runnable app yet.
 
-## Current scope
+## Relationship to the Mac app
 
-The root `CMakeLists.txt` builds the platform-neutral media-core sources as
-`khua_media_portable` and runs host-side unit tests. It does not replace the
-Mac build (`Apps/Mac/Scripts/build.sh`).
+The Windows port owns its code. `MediaCore/` started as a copy of the portable
+parts of `Modules/MediaCore` (the demuxer, recovery and resilience logic,
+playback policies, and the file, thread and executor layers written for the
+port) and is maintained here independently. The Windows build never compiles
+anything under `Modules/`, and changes for Windows never touch the Mac app, so
+they need no Mac build or playback check.
+
+The Mac player (`Modules/MediaCore/Bridge/SPPlayerCore.mm` and
+`Platform/macOS`) is the reference for behaviour: the Windows player core is
+written from it in C++, against the interfaces in `MediaCore/Core/Player`. A
+fix made on one side is ported to the other by hand.
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `MediaCore/Core` | Demuxer, recovery, resilience, seek and source-growth logic; `Platform/` (file access and threads on Win32); `Player/` (executor, background tasks, frame handle, listener, audio sink) |
+| `MediaCore/Bridge` | Portable playback policies and helpers: frame selection, time stretch, subtitle compositing, color metadata, channel mapping, Dolby Vision RPU |
+| `Tests/MediaCore` | GoogleTest suites and the header check |
+| `vcpkg/ports/ffmpeg` | FFmpeg overlay port |
 
 ## Prerequisites
 
@@ -56,17 +72,14 @@ restores the trailing blank context line (a single space) that the Mac copy
 lacks; GNU `patch` on the Mac accepts either form. Keep that line when
 re-copying the patch.
 
-## Porting status
+## Status
 
 | Area | State |
 |---|---|
-| 55 `Core/` and `Bridge/` headers | Each compiles on its own under clang-cl (`khua_header_check`) |
-| `TsRapScan.cpp`, `SPDoviRPU.cpp`, `SPFrameSelectionPolicy.cpp`, `SPSubtitleCompositor.cpp` | In `khua_media_portable` |
-| `Core/Platform/SPFileSystem*`, `SPThread*` | File handles, positional reads, stat, current path, local/remote volume, sparse ranges, writer detection, thread names and priorities, disk I/O throttling, and interrupting a blocked read (SIGUSR2 on macOS, `CancelSynchronousIo` on Windows). Errors are errno values on both. Paths beyond `MAX_PATH` need the app's `longPathAware` manifest setting |
-| `Core/Demuxer.cpp` | In `khua_media_portable`; all OS access goes through spfs. `DemuxerTests` open, read and seek a WAV with a Korean name. Windows handles are overlapped, so the reader, prefetch and scrub threads never queue behind one another, and an interrupt cancels the pending read with `CancelIoEx` |
-| `SPColorMetadata.hpp`, `SPAudioChannelMap.hpp` | Portable. `SPVideoColorMetadata.hpp` keeps only the CoreVideo tag mapping on top of `SPColorMetadata.hpp`; channel labels are `SPSpeakerLabel`, whose values equal CoreAudio's |
-| `SPPacketDataSnapshot.hpp`, `SPMotionFrameCompatibility.hpp` | Mac-only by design: an `NSData` view for Objective-C callers, and Motion+ `CVPixelBuffer` checks. The C++ core will get its own packet snapshot when it needs one |
-| `Core/Player/SPExecutor`, `SPTasks`, `SPSync` | Process-wide UI-thread executor and background tasks (one-off tasks, serial queues, repeating timers), plus `WaitGroup`/`Semaphore`. `SPPlayerCore.mm` uses them instead of GCD (steps 1–2 of the core extraction); macOS installs GCD-backed implementations, Windows uses `SPThreadTasks.cpp` |
-| `Core/Player/SPPlayerListener.hpp` | Events the core reports to its host (`PlayerListener`, `PlayerError`). `SPPlayerCore.mm` raises all delegate events through it (step 5); on macOS `SPDelegateListener.mm` forwards to `SPPlayerCoreDelegate` |
-| `Core/Player/SPVideoFrame.hpp` | Opaque, reference-counted frame handle (`VideoFrameRef`, CF ownership rules). The core's frame state in `SPPlayerCore.mm` uses it (step 4); on macOS it wraps `CVPixelBuffer`. `SP_VIDEO_FRAME_CV_BRIDGE` lets the `.mm` mix it with `CVPixelBufferRef` until the core moves to C++; `VideoFrameBridgeTests` compiles those expressions on Windows |
-| `SPPlayerCore.mm` and the other Objective-C++ bridge files | In progress: being split into a C++ core and platform adapters, one behaviour-preserving step at a time |
+| Headers | Every `Core/` and `Bridge/` header compiles on its own (`khua_header_check`) |
+| `Core/Demuxer.cpp` | Builds; all OS access goes through `Core/Platform`. `DemuxerTests` open, read and seek a WAV with a Korean name, and rename and delete it while open |
+| `Core/Platform` | Win32 file handles (overlapped, fully shared so downloads continue and can be renamed), positional reads, stat, current path, local/remote volume, sparse ranges, writer detection, thread names and priorities, and cancelling a blocked read with `CancelIoEx`/`CancelSynchronousIo`. Errors are errno values. Paths beyond `MAX_PATH` need the app's `longPathAware` manifest setting |
+| `Core/Player` | UI-thread executor, background tasks (std::thread), `WaitGroup`/`Semaphore`, `VideoFrameRef`, `PlayerListener`/`PlayerError`, and `AudioSink`/`AudioSinkRef`: the interfaces the Windows player core is written against |
+| Player core | Not yet: to be written in C++ from `SPPlayerCore.mm` |
+| Output | Not yet: D3D11 renderer and HLSL shaders, WASAPI audio sink, D3D11VA decoding |
+| App | Not yet: C ABI DLL and WinUI 3 app |
