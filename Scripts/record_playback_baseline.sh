@@ -12,6 +12,7 @@
 # comparing: first frame, pacing, seeks, A/V sync, stop/join timings, errors.
 #
 # Quit every other Khua instance first: the app is quit by bundle identifier.
+# The saved resume positions of the given files are cleared before each run.
 set -euo pipefail
 CALLER_DIR=$(pwd)
 cd "$(dirname "$0")/.."
@@ -64,6 +65,16 @@ rate|12|SP_AUTORATE=2:2,0.5:5,1:8
 reopen|9|SP_SEQOPEN2=NEXT
 "
 
+# The app resumes each file where it was last left (RecentPlays.swift stores
+# the position as "sp.pos.<path>"), which would make every scenario depend on
+# the one before it. Forget those positions so each run starts at zero.
+forget_resume_positions() {
+    local media
+    for media in "${files[@]}"; do
+        defaults delete "$BUNDLE_ID" "sp.pos.$media" >/dev/null 2>&1 || true
+    done
+}
+
 wait_for_exit() {
     local i
     for i in $(seq 1 100); do
@@ -86,6 +97,7 @@ run_one() {
         args+=(--env "${kv//NEXT/$next}")
     done
     echo "==> $base: $name (${seconds}s)"
+    forget_resume_positions
     open "${args[@]}" --stdout "$log.stdout" --stderr "$log" "$media"
     sleep "$seconds"
     osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
