@@ -66,4 +66,5 @@ re-copying the patch.
 | `Core/Demuxer.cpp` | In `khua_media_portable`; all OS access goes through spfs. `DemuxerTests` open, read and seek a WAV with a Korean name. Windows handles are overlapped, so the reader, prefetch and scrub threads never queue behind one another, and an interrupt cancels the pending read with `CancelIoEx` |
 | `SPColorMetadata.hpp`, `SPAudioChannelMap.hpp` | Portable. `SPVideoColorMetadata.hpp` keeps only the CoreVideo tag mapping on top of `SPColorMetadata.hpp`; channel labels are `SPSpeakerLabel`, whose values equal CoreAudio's |
 | `SPPacketDataSnapshot.hpp`, `SPMotionFrameCompatibility.hpp` | Mac-only by design: an `NSData` view for Objective-C callers, and Motion+ `CVPixelBuffer` checks. The C++ core will get its own packet snapshot when it needs one |
-| `SPPlayerCore.mm` and the other Objective-C++ bridge files | Not yet: to be split into a C++ core and platform adapters |
+| `Core/Player/SPExecutor` | The process-wide UI-thread executor. `SPPlayerCore.mm` posts through it (step 1 of the core extraction); macOS installs the main dispatch queue |
+| `SPPlayerCore.mm` and the other Objective-C++ bridge files | In progress: being split into a C++ core and platform adapters, one behaviour-preserving step at a time |

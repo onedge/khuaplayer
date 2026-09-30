@@ -26,6 +26,7 @@ set(KHUA_PORTABLE_HEADERS
     Core/Platform/SPFileSystem.hpp
     Core/Platform/SPThread.hpp
     Core/Platform/SPWin32.hpp
+    Core/Player/SPExecutor.hpp
     Core/Recovery/RecoveryAsfRm.hpp
     Core/Recovery/RecoveryAvi.hpp
     Core/Recovery/RecoveryBase.hpp
@@ -85,6 +86,7 @@ add_executable(khua_mediacore_tests
     AnnexBStartCodeTests.cpp
     ColorAndChannelTests.cpp
     DemuxerTests.cpp
+    ExecutorTests.cpp
     FFmpegConfigurationTests.cpp
     FileSystemTests.cpp
     FrameSelectionPolicyTests.cpp

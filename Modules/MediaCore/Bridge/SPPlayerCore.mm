@@ -1,4 +1,6 @@
 #import "SPPlayerCore.h"
+#import "SPDispatchExecutor.h"
+#include "Player/SPExecutor.hpp"
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1046,6 +1048,12 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 
 #pragma mark - Lifecycle
 
+// The core posts UI-thread work through sp::mainThread(); install the main
+// dispatch queue executor before this class does anything else.
++ (void)initialize {
+    if (self == [SPPlayerCore class]) SPInstallDispatchMainThreadExecutor();
+}
+
 static int spProbeInterrupt(void *opaque);
 
 struct SPDisplaySizeProbeContext {
@@ -1216,7 +1224,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             }
             return;
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             if (self->_openGeneration.load() != gen) return;
             double pos = self->_position;
             SPLOG(@"[Core] 坏重排封装（B 帧深度=%d + 容器无 ctts）→ 软解重开 @%.1fs", hb, pos);
@@ -1428,7 +1436,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             SPPlayerCore *sself = weakSelf;
             if (!sself) return;
             if (!sself->_subtitleRefreshPending.exchange(true)) {
-                dispatch_async(dispatch_get_main_queue(), ^{
+                sp::mainThread().post(^{
                     sself->_subtitleRefreshPending.store(false);
                     [sself refreshSubtitleDisplay];
                 });
@@ -1495,7 +1503,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 
             if (weakSelf == nil) return;
             lastBeat = 0;
-            dispatch_async(dispatch_get_main_queue(), ^{ lastBeat = spNowUs(); });
+            sp::mainThread().post(^{ lastBeat = spNowUs(); });
             usleep(2000000);
             if (lastBeat == 0) {
                 NSLog(@"[c%u][Freeze] 主线程疑似卡死（3s 心跳无响应）！", logId);
@@ -1610,7 +1618,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         if (spDebug()) {
             SPLOG(@"[Core] 后台准备: %lldms (demux+解码器)", prepUs / 1000);
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             if (gen != self->_openGeneration) {
 
                 return;
@@ -2828,8 +2836,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _demuxer->onRemoteVolume() && attempt < 14 && !_demuxer->eof() &&
         _videoPackets->size() < MAX(primeTarget, (size_t)1)) {
         const int64_t gen = _openGeneration.load();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{
+        sp::mainThread().postAfter(50000, ^{
             if (self->_openGeneration.load() != gen) return;
             [self beginPlaybackPrimedAtSec:startSec attempt:attempt + 1];
         });
@@ -3449,7 +3456,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 - (void)armPausedSeekPresentation {
     if (_displayLink) _displayLink.paused = NO;
     const int64_t wdSeq = _pausedSeekWatchdogSeq.fetch_add(1) + 1;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    sp::mainThread().postAfter(1000000, ^{
         if (self->_pausedSeekWatchdogSeq.load() != wdSeq) return;
 
         if (self->_state == SPPlayerStatePaused &&
@@ -3506,8 +3513,7 @@ static BOOL spThumbsEnabled(void) {
 
     if (![self timelinePreviewEligible] || _duration < 10.0) return;
     const int64_t gen = _openGeneration.load();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
+    sp::mainThread().postAfter(2000000, ^{
         if (self->_openGeneration.load() != gen) return;
         [[self ensureThumbnailerForGeneration:gen] startSweep];
     });
@@ -3729,8 +3735,8 @@ static BOOL spThumbsEnabled(void) {
             [delegate playerCoreDidChangeFrameInterpolation:self];
         }
     };
-    if ([NSThread isMainThread]) notify();
-    else dispatch_async(dispatch_get_main_queue(), notify);
+    if (sp::mainThread().isCurrent()) notify();
+    else sp::mainThread().post(notify);
 }
 
 - (SPFrameInterpolationMode)frameInterpolationMode {
@@ -4001,7 +4007,7 @@ static BOOL spThumbsEnabled(void) {
                   silent:(BOOL)silent
               completion:(void (^)(BOOL))completion {
     if (!_subtitleRenderer) {
-        if (completion) dispatch_async(dispatch_get_main_queue(),
+        if (completion) sp::mainThread().post(
                                        ^{ completion(NO); });
         return NO;
     }
@@ -4012,7 +4018,7 @@ static BOOL spThumbsEnabled(void) {
     NSString *pathCopy = [path copy];
 
     void (^reject)(NSString *) = ^(NSString *reason) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             if (completion) completion(NO);
             if (self->_subLoadGen.load() != loadGen) return;
             if (silent) return;
@@ -4091,7 +4097,7 @@ static BOOL spThumbsEnabled(void) {
             reject(NSLocalizedString(@"subtitle.load.reason.encoding", nil));
             return;
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
 
             if (self->_subLoadGen.load() != loadGen) {
                 if (spDebug()) SPLOG(@"[Core] 外挂字幕读取已过期，丢弃: %@",
@@ -4280,7 +4286,7 @@ static NSString *spClaimScreenshotPath(NSString *base) {
         CVPixelBufferRelease(snapshot);
         NSString *finalPath = target ?: pathCopy;
         if (completion) {
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(ok, finalPath); });
+            sp::mainThread().post(^{ completion(ok, finalPath); });
         }
     });
 }
@@ -5161,7 +5167,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
             }
         }
         const BOOL wasCancelled = cancelled.load(std::memory_order_acquire);
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             SPPlayerCore *s = weakSelf;
             if (s) [s applyAudioRecoveryResult:res request:req cancelled:wasCancelled];
         });
@@ -5185,7 +5191,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     if (!info.md5Present() || memcmp(info.md5, md5, 16) != 0 || info.totalSamples == 0 || info.totalSamples == samples || info.sampleRate == 0) return;
     const double newDur = (double)samples / (double)info.sampleRate;
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         if (self->_openGeneration.load(std::memory_order_acquire) != og || self->_generation.load() != gen) return;
         if (fabs(newDur - self->_duration) <= 0.5) return;
         SP_RESLOG(@"FLAC 总样本数声明 %llu 与实际解出 %llu 矛盾，而全流 MD5 与原存值相等：时长 %.2fs → %.2fs",
@@ -5214,7 +5220,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     const int64_t gen = _openGeneration.load();
     SPLOG(@"[Resilient] %@：视频轨 流#%d 不可解而文件另有视频轨 流#%d → 排除后重开", why, cur, alt);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         if (self->_openGeneration.load() != gen) return;
         NSString *path = [self->_currentFilePath copy];
         if (!path) return;
@@ -5317,7 +5323,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     [_subtitleRenderer processChunk:(const uint8_t *)utf8 length:strlen(utf8)
                               ptsUs:startUs durationUs:durationUs];
     if (!_subtitleRefreshPending.exchange(true)) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             self->_subtitleRefreshPending.store(false);
             [self refreshSubtitleDisplay];
         });
@@ -5436,7 +5442,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     }
 
     if (!_subtitleRefreshPending.exchange(true)) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             self->_subtitleRefreshPending.store(false);
             [self refreshSubtitleDisplay];
         });
@@ -5621,13 +5627,13 @@ static void spApplyDecodeQoS() {
 
             if (_demuxer->matroskaLike()) {
                 __weak SPPlayerCore *weakSelf = self;
-                dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf scheduleContentSearchCheckAfterMs:450]; });
+                sp::mainThread().post(^{ [weakSelf scheduleContentSearchCheckAfterMs:450]; });
             }
             int sret = _demuxer->seekToUs(seekUs, seekForward, seekOriginUs,
                                           &seekAbort, seekAlignTolUs);
             if (_demuxer->mkvContentScanPending()) {
                 __weak SPPlayerCore *weakSelf = self;
-                dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf startMkvContentScanIfPending]; });
+                sp::mainThread().post(^{ [weakSelf startMkvContentScanIfPending]; });
             }
 
             if (sret >= 0) {
@@ -5637,7 +5643,7 @@ static void spApplyDecodeQoS() {
                     const int64_t og = _openGeneration.load(std::memory_order_acquire);
                     const double snapSec = snapUs / 1e6;
                     __weak SPPlayerCore *weakSelf = self;
-                    dispatch_async(dispatch_get_main_queue(), ^{
+                    sp::mainThread().post(^{
                         SPPlayerCore *s = weakSelf;
                         if (!s || s->_openGeneration.load(std::memory_order_acquire) != og || s->_seekMailbox.peek()) return;
                         [s seekTo:snapSec precise:YES];
@@ -5693,7 +5699,7 @@ static void spApplyDecodeQoS() {
 
                 if (spDebug()) SPLOG(@"[Demux] seek 失败 ret=%d → 就地恢复", sret);
                 int64_t failedGen = seekGen;
-                dispatch_async(dispatch_get_main_queue(), ^{
+                sp::mainThread().post(^{
                     if (!spPlayerSeekCallbackIsCurrent(
                             sessionOpenGeneration,
                             self->_openGeneration.load(),
@@ -5867,7 +5873,7 @@ static void spApplyDecodeQoS() {
 
             if (++totalErrStreak == 40) {
                 int errorCode = r;
-                dispatch_async(dispatch_get_main_queue(), ^{
+                sp::mainThread().post(^{
                     if (!spPlayerSessionIsCurrent(
                             sessionOpenGeneration,
                             self->_openGeneration.load())) return;
@@ -5892,7 +5898,7 @@ static void spApplyDecodeQoS() {
         if (!videoIsolationNoted && _demuxer->videoTrackIsolated()) {
             videoIsolationNoted = true;
             const int64_t og = _openGeneration.load(std::memory_order_acquire);
-            dispatch_async(dispatch_get_main_queue(), ^{
+            sp::mainThread().post(^{
                 if (self->_openGeneration.load(std::memory_order_acquire) != og || self->_videoTrackGivenUp) return;
                 self->_videoTrackGivenUp = YES;
                 [self resilientNoteTrack:spresil::Track::Video cls:spresil::DamageClass::None
@@ -6027,9 +6033,9 @@ static void spApplyDecodeQoS() {
     PushResult result = _frames->pushInterruptibly(std::move(frame), interruptGeneration);
     if (result != PushResult::Pushed) return result;
     if (_firstFramePending.load()) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self tryPresentFirstFrame]; });
+        sp::mainThread().post(^{ [self tryPresentFirstFrame]; });
     } else if (_seekFramePending.load()) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self tryPresentSeekFrame]; });
+        sp::mainThread().post(^{ [self tryPresentSeekFrame]; });
     }
     return PushResult::Pushed;
 }
@@ -6052,9 +6058,9 @@ static void spApplyDecodeQoS() {
     PushResult result = motionFrames->pushInterruptibly(std::move(frame), interruptGeneration);
     if (result != PushResult::Pushed) return result;
     if (_firstFramePending.load()) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self tryPresentFirstFrame]; });
+        sp::mainThread().post(^{ [self tryPresentFirstFrame]; });
     } else if (_seekFramePending.load()) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self tryPresentSeekFrame]; });
+        sp::mainThread().post(^{ [self tryPresentSeekFrame]; });
     }
     return PushResult::Pushed;
 }
@@ -6115,7 +6121,7 @@ static void spApplyDecodeQoS() {
         if (spDebug()) SPLOG(@"[MEMC] 按需创建插帧队列 cap=%zu", cap);
     }
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         if (!self->_running.load() ||
             self->_interpolationPolicyEpoch.load() != transitionEpoch ||
             self->_frameInterpolationModeValue.load() != (int)mode) {
@@ -7448,7 +7454,7 @@ static void spApplyDecodeQoS() {
                     const int64_t og = _openGeneration.load(std::memory_order_acquire);
                     SPLOG(@"[Resilient] 音轨 流#%d 连续 %d 包解码失败（首包 %.3fs，本会话已出声 %lld 帧）→ 请求音轨恢复",
                           _audioStreamIndex, audioErrRun, failUs / 1e6, (long long)_audioSessionPcmFrames.load());
-                    dispatch_async(dispatch_get_main_queue(), ^{ [self recoverAudioAfterDecodeFailureAtUs:failUs openGen:og]; });
+                    sp::mainThread().post(^{ [self recoverAudioAfterDecodeFailureAtUs:failUs openGen:og]; });
                 }
             }
 
@@ -7755,7 +7761,7 @@ static void spApplyDecodeQoS() {
                   _decErrStreak.load());
 
             const int64_t genAtFallback = _openGeneration;
-            dispatch_async(dispatch_get_main_queue(), ^{
+            sp::mainThread().post(^{
                 if (self->_openGeneration != genAtFallback) return;
                 [self openFileAtPath:retryPath error:nil];
             });
@@ -7827,7 +7833,7 @@ static void spApplyDecodeQoS() {
 #if !SP_APP_STORE
 
         if (spAutomation() && getenv("SP_AUTOREPLAY")) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            sp::mainThread().postAfter(1000000, ^{
                 [self seekTo:3.0];
                 if (spDebug()) SPLOG(@"[Test] Ended 后重播 seek→3s");
             });
@@ -8404,7 +8410,7 @@ static void spApplyDecodeQoS() {
     __weak SPPlayerCore *weakSelf = self;
     dispatch_async(_pendingScanQueue, ^{
         auto spans = std::make_shared<std::vector<std::pair<int64_t, int64_t>>>(spRunPendingScan(*job));
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             SPPlayerCore *s = weakSelf;
             if (!s || s->_openGeneration.load(std::memory_order_acquire) != og) return;
             s->_pendingScanInFlight = NO;
@@ -8433,7 +8439,7 @@ static void spApplyDecodeQoS() {
     dispatch_async(_pendingScanQueue, ^{
         spRunMkvContentScan(*job, [weakSelf, og](std::vector<std::pair<int64_t, int64_t>> spans) {
             auto boxed = std::make_shared<std::vector<std::pair<int64_t, int64_t>>>(std::move(spans));
-            dispatch_async(dispatch_get_main_queue(), ^{
+            sp::mainThread().post(^{
                 SPPlayerCore *s = weakSelf;
                 if (!s || s->_openGeneration.load(std::memory_order_acquire) != og) return;
                 if (*boxed == s->_noContentSpansUs) return;
@@ -8455,7 +8461,7 @@ static void spApplyDecodeQoS() {
     _contentSearchCheckQueued = YES;
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     __weak SPPlayerCore *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    sp::mainThread().postAfter(ms * 1000, ^{
         SPPlayerCore *s = weakSelf;
         if (!s) return;
         s->_contentSearchCheckQueued = NO;
@@ -8536,7 +8542,7 @@ static void spApplyDecodeQoS() {
         const BOOL nowStalled = v == IndexWaitVerdict::Stalled;
         if (!done && nowStalled == sentStalled) return;
         sentStalled = nowStalled;
-        dispatch_async(dispatch_get_main_queue(), ^{
+        sp::mainThread().post(^{
             SPPlayerCore *s = weakSelf;
             if (!s || !s->_indexWaiting || s->_openGeneration.load(std::memory_order_acquire) != og) return;
             if (done) {
@@ -9082,7 +9088,7 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     }
 
     if (leftOpening && _audioOutput && [_audioOutput outputLayoutChangePending]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self handleAudioOutputLayoutChange]; });
+        sp::mainThread().post(^{ [self handleAudioOutputLayoutChange]; });
     }
 }
 
@@ -9137,7 +9143,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     _holeHeadToUs.store(-1);
     _lastDemuxedPos.store(-1);
 
-    dispatch_async(dispatch_get_main_queue(), ^{ [self resilientDeliverDamageNotifyForGen:-1]; });
+    sp::mainThread().post(^{ [self resilientDeliverDamageNotifyForGen:-1]; });
     _dbgResilLogs.store(0, std::memory_order_relaxed);
 
 #if SP_APP_STORE
@@ -9309,7 +9315,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 - (void)notifySkippedMissingFrom:(int64_t)fromUs to:(int64_t)toUs afterSeek:(BOOL)afterSeek {
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     __weak SPPlayerCore *weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         SPPlayerCore *s = weakSelf;
         if (!s || s->_openGeneration.load(std::memory_order_acquire) != og) return;
         if ([s->_delegate respondsToSelector:@selector(playerCore:didSkipMissingContentFrom:to:afterSeek:)])
@@ -9342,7 +9348,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     if (_damageNotifyHopQueued.exchange(true, std::memory_order_acq_rel)) return;
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     __weak SPPlayerCore *weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         SPPlayerCore *s = weakSelf;
         if (s) [s resilientDeliverDamageNotifyForGen:og];
     });
@@ -9356,7 +9362,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
         if (_damageNotifyPending) return;
         _damageNotifyPending = YES;
         __weak SPPlayerCore *weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, wait * NSEC_PER_USEC), dispatch_get_main_queue(), ^{
+        sp::mainThread().postAfter(wait, ^{
             SPPlayerCore *s = weakSelf;
             if (!s) return;
             s->_damageNotifyPending = NO;
@@ -9409,7 +9415,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 - (void)resilientNoteEpochOffsetUs:(int64_t)offsetUs video:(BOOL)isVideo {
     (isVideo ? _epochOffsetVideoUs : _epochOffsetAudioUs).store(offsetUs);
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         if (self->_openGeneration.load(std::memory_order_acquire) != og) return;
         int64_t target = INT64_MAX;
         if (self->_videoStreamIndex >= 0) target = MIN(target, self->_epochOffsetVideoUs.load());
@@ -9432,7 +9438,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
             const double newDur = e.newDurationUs / 1e6;
             const int64_t og = _openGeneration.load(std::memory_order_acquire);
-            dispatch_async(dispatch_get_main_queue(), ^{
+            sp::mainThread().post(^{
                 if (self->_openGeneration.load(std::memory_order_acquire) != og) return;
                 if (newDur > self->_duration + 0.5) {
                     SPLOG(@"[Resilient] 容器恢复后时长 %.2fs → %.2fs", self->_duration, newDur);
@@ -9542,7 +9548,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
     NSString *name = nd.decoderName;
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    sp::mainThread().post(^{
         if (self->_openGeneration.load(std::memory_order_acquire) != og) return;
         self->_decoderNamePub = name;
 
