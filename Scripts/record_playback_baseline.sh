@@ -13,6 +13,7 @@
 #
 # Quit every other Khua instance first: the app is quit by bundle identifier.
 set -euo pipefail
+CALLER_DIR=$(pwd)
 cd "$(dirname "$0")/.."
 
 BUILD=1
@@ -27,7 +28,8 @@ fi
 LABEL=$1
 shift
 
-APP=.build/Build/Products/Debug/Khua.app
+# open -a needs an absolute path; a relative one is looked up as an app name.
+APP="$(pwd)/.build/Build/Products/Debug/Khua.app"
 BUNDLE_ID=app.khuaplayer.KhuaPlayer
 OUT=.build/baseline/$LABEL
 
@@ -35,8 +37,15 @@ if pgrep -x Khua >/dev/null; then
     echo "error: quit every running Khua instance first" >&2
     exit 1
 fi
+# Media paths are relative to the caller's directory, not the repository root.
+files=()
 for media in "$@"; do
+    case $media in
+        /*) ;;
+        *) media="$CALLER_DIR/$media" ;;
+    esac
     [ -f "$media" ] || { echo "error: not a file: $media" >&2; exit 1; }
+    files+=("$media")
 done
 if [ "$BUILD" = 1 ]; then
     ./Scripts/build.sh Debug
@@ -85,7 +94,6 @@ run_one() {
     rm -f "$log.stdout"
 }
 
-files=("$@")
 count=${#files[@]}
 for ((i = 0; i < count; i++)); do
     media=${files[$i]}
