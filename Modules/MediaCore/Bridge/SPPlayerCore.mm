@@ -578,6 +578,10 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     CAMetalLayer *_layer;
     SPMetalRenderer *_renderer;
     id<SPVideoDecoding> _decoder;
+    // _decoder is replaced on the decode thread. Main-thread code reads the
+    // backend from here instead of messaging _decoder, which could be released
+    // concurrently. Zero, like a message to nil, means FFmpeg software.
+    std::atomic<uint8_t> _decoderBackendPub;
     SPAudioDecoder *_audioDecoder;
     SPAudioOutput *_audioOutput;
     std::unique_ptr<BoundedQueue<TaggedPacket>> _audioPackets;
@@ -1243,6 +1247,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _layer = (CAMetalLayer *)view.layer;
         _renderer = [[SPMetalRenderer alloc] initWithLayer:_layer logId:_spLogId];
         _decoder = nil;
+        [self publishDecoderBackend];
         _demuxer = std::make_unique<Demuxer>();
 
         {
@@ -1620,6 +1625,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _prepPath = path;
 
     if (_decoder) { [_decoder shutdown]; _decoder = nil; }
+    [self publishDecoderBackend];
     _audioDecoder = nil;
 
     _audioOnlySession.store(false);
@@ -2207,6 +2213,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     int dret = vtRet;
     if (vt) {
         _decoder = vt;
+        [self publishDecoderBackend];
 
     }
     if (!_decoder) {
@@ -2220,6 +2227,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                         timeBaseDenominator:vs.timeBase.den];
         if (dret == 0) {
             _decoder = sw;
+            [self publishDecoderBackend];
         }
     }
     if (spDebug()) {
@@ -2349,6 +2357,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     if (_thumbVideoPar) avcodec_parameters_free(&_thumbVideoPar);
     [_decoder shutdown];
     _decoder = nil;
+    [self publishDecoderBackend];
     if (_audioDecoder) [_audioDecoder shutdown];
 
     _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
@@ -7015,6 +7024,7 @@ static void spApplyDecodeQoS() {
                         const BOOL wasVT = _decoder.decodingBackend == SPVideoDecodingBackendVideoToolbox;
                         [_decoder shutdown];
                         _decoder = nd;
+                        [self publishDecoderBackend];
 
                         _laneOnSW = wasVT && nd.decodingBackend == SPVideoDecodingBackendFFmpegSoftware &&
                                     !_resilientDryRun.load(std::memory_order_relaxed);
@@ -7735,7 +7745,7 @@ static void spApplyDecodeQoS() {
         if (altPending) return;
 
         if (!_swTerminalFallbackTried &&
-            _decoder.decodingBackend == SPVideoDecodingBackendVideoToolbox &&
+            (SPVideoDecodingBackend)_decoderBackendPub.load(std::memory_order_acquire) == SPVideoDecodingBackendVideoToolbox &&
             !((audioBusy || audioCarried) && _laneSWCandidateRejected)) {
             _swTerminalFallbackTried = YES;
             _pendingForceSW = YES;
@@ -9520,6 +9530,14 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     }
 }
 
+// Call after every assignment to _decoder, on the thread that assigned it.
+// A decoder's backend never changes, so the published value stays correct
+// until the next assignment.
+- (void)publishDecoderBackend {
+    const uint8_t backend = _decoder ? (uint8_t)_decoder.decodingBackend : 0;
+    _decoderBackendPub.store(backend, std::memory_order_release);
+}
+
 - (void)publishReplacedDecoderName:(id<SPVideoDecoding>)nd {
 
     NSString *name = nd.decoderName;
@@ -9715,6 +9733,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
         SPFFmpegDecoder* candidate = ready->candidate;
         [_decoder shutdown];
         _decoder = candidate;
+        [self publishDecoderBackend];
         ready->candidate = nil; // RAII no longer owns the committed decoder
         committed = YES;
         SP_G1_REASON("useful_output_committed");
@@ -9968,6 +9987,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     }
     [_decoder shutdown];
     _decoder = sw;
+    [self publishDecoderBackend];
     [self publishReplacedDecoderName:sw];
     _decErrStreak.store(0);
     _laneOnSW = YES;
@@ -10039,6 +10059,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     }
     [_decoder shutdown];
     _decoder = vt;
+    [self publishDecoderBackend];
     [self publishReplacedDecoderName:vt];
     _laneOnSW = NO;
     _laneKeyDecodedOnVT = YES;
