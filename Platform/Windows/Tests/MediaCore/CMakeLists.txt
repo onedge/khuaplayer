@@ -27,6 +27,8 @@ set(KHUA_PORTABLE_HEADERS
     Core/Platform/SPThread.hpp
     Core/Platform/SPWin32.hpp
     Core/Player/SPExecutor.hpp
+    Core/Player/SPSync.hpp
+    Core/Player/SPTasks.hpp
     Core/Recovery/RecoveryAsfRm.hpp
     Core/Recovery/RecoveryAvi.hpp
     Core/Recovery/RecoveryBase.hpp
@@ -91,6 +93,7 @@ add_executable(khua_mediacore_tests
     FileSystemTests.cpp
     FrameSelectionPolicyTests.cpp
     SubtitleCompositorTests.cpp
+    TasksTests.cpp
     ThreadTests.cpp
     TsRapPolicyTests.cpp
 )

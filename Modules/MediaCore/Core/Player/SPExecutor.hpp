@@ -14,6 +14,20 @@
 
 namespace sp {
 
+// A repeating UI-thread timer that keeps firing while the UI is tracking a
+// menu or a live resize (NSRunLoopCommonModes on macOS). All methods are
+// called on the UI thread.
+class MainRepeatingTimer {
+public:
+    virtual ~MainRepeatingTimer() = default;
+    // Stops firing until resumeNow().
+    virtual void suspend() = 0;
+    // Fires as soon as possible, then every interval from then on.
+    virtual void resumeNow() = 0;
+    // Stops for good and releases the handler.
+    virtual void cancel() = 0;
+};
+
 class MainThreadExecutor {
 public:
     virtual ~MainThreadExecutor() = default;
@@ -24,6 +38,10 @@ public:
     // Runs `task` on the UI thread no earlier than `delayUs` from now.
     virtual void postAfter(int64_t delayUs, std::function<void()> task) = 0;
     virtual bool isCurrent() const = 0;
+    // First fires one interval from now. The timer holds the handler, and so
+    // whatever it captures, until cancel().
+    virtual std::shared_ptr<MainRepeatingTimer> makeRepeatingTimer(int64_t intervalUs,
+                                                                   std::function<void()> handler) = 0;
 };
 
 // Installs the process-wide executor. Call once, before the first player is

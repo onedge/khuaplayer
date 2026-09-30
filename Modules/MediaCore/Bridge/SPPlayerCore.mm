@@ -1,6 +1,8 @@
 #import "SPPlayerCore.h"
 #import "SPDispatchExecutor.h"
 #include "Player/SPExecutor.hpp"
+#include "Player/SPSync.hpp"
+#include "Player/SPTasks.hpp"
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -651,7 +653,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 
     std::atomic<bool> _audioOnlySession;
 
-    NSTimer *_audioOnlyTimer;
+    std::shared_ptr<sp::MainRepeatingTimer> _audioOnlyTimer;
 
     BOOL _pubSourceGrowing;
     BOOL _pubSourceWaiting;
@@ -667,13 +669,13 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 
     std::shared_ptr<IndexWaitState> _indexWaitPrepState;
     IndexWaitVerdict _indexWaitPrepVerdict;
-    dispatch_source_t _indexWaitTimer;
+    std::shared_ptr<sp::RepeatingTimer> _indexWaitTimer;
     BOOL _indexWaiting;
     BOOL _indexWaitStalled;
     BOOL _pendingScanInFlight;
     int64_t _lastSourceWaitSeenUs;
     int64_t _pendingScanLastUs;
-    dispatch_queue_t _pendingScanQueue;
+    std::shared_ptr<sp::SerialQueue> _pendingScanQueue;
 
     std::mutex _videoCoverageMtx;
     sp::ContentCoverage _videoCoverage;
@@ -810,7 +812,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 
     std::atomic<int64_t> _eofDrainedGen;
     std::atomic<double> _playbackRate; // 0.25–5.0; main-thread writes, audio/render reads.
-    dispatch_queue_t _openQueue;
+    std::shared_ptr<sp::SerialQueue> _openQueue;
     double _volume;                 // Software gain 0~5 (UI percentage / 100)
     BOOL _muted;
     double _loopA, _loopB;
@@ -1051,7 +1053,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 // The core posts UI-thread work through sp::mainThread(); install the main
 // dispatch queue executor before this class does anything else.
 + (void)initialize {
-    if (self == [SPPlayerCore class]) SPInstallDispatchMainThreadExecutor();
+    if (self == [SPPlayerCore class]) SPInstallDispatchExecutors();
 }
 
 static int spProbeInterrupt(void *opaque);
@@ -1209,7 +1211,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     NSString *path = _reorderProbePath;
     if (!pktData || !path) return;
     const int64_t gen = _openGeneration.load();
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    sp::backgroundTasks().runAsync(sp::TaskQos::Utility, ^{
         int hb = spProbeStreamHasBFrames(cid, extra, pktData);
         if (hb <= 0) {
             if (spDebug()) {
@@ -1334,7 +1336,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _restampNextPtsUs = -1;
         _eofDrainedGen = -1;
         _playbackRate.store(1.0);
-        _openQueue = dispatch_queue_create("dev.khuaplayer.open", DISPATCH_QUEUE_SERIAL);
+        _openQueue = sp::backgroundTasks().makeSerialQueue("dev.khuaplayer.open", sp::TaskQos::Unspecified);
         _volume = 1.0;
         _muted = NO;
         _loopA = -1;
@@ -1454,7 +1456,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             // GPU/driver and CoreAudio HAL cold initialization are process-wide,
             // so each warm-up is issued at most once to avoid redundant startup
             // contention across multiple cores.
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            sp::backgroundTasks().runAsync(sp::TaskQos::Utility, ^{
                 static std::atomic<bool> gGpuWarmIssued{false};
                 if (gGpuWarmIssued.exchange(true)) return;
                 if (self->_openGeneration > 0) return;
@@ -1463,7 +1465,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                 if (spDebug()) SPLOG(@"[Core] GPU预热: %lldms", (spNowUs() - t0) / 1000);
             });
 
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            sp::backgroundTasks().runAsync(sp::TaskQos::UserInitiated, ^{
                 static std::atomic<bool> gAudioWarmIssued{false};
                 if (gAudioWarmIssued.exchange(true)) return;
                 if (self->_openGeneration > 0) return;
@@ -1475,8 +1477,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             // loading; later sessions cost about 1.3 ms. Delay warm-up by 300 ms
             // so a launch-time media open can claim the VT driver first instead
             // of contending with a speculative session.
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
-                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            sp::backgroundTasks().runAfter(sp::TaskQos::UserInitiated, 300000, ^{
                 if (gVtWarmIssued.exchange(true)) return; // process-wide once gate
                 if (self->_openGeneration > 0 || gRealOpenIssued.load()) return;
                 int64_t t0 = spNowUs();
@@ -1496,7 +1497,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     if (!getenv("SP_FREEZE_LOG")) return;
     const unsigned logId = _spLogId;
     __weak SPPlayerCore *weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+    sp::backgroundTasks().runAsync(sp::TaskQos::Background, ^{
         __block uint64_t lastBeat = 0;
         while (true) {
             usleep(3000000);
@@ -1608,7 +1609,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _audioSessionPcmFrames.store(0);
 
     const std::vector<int> excludedSnapshot(_sessionExcludedVideo.begin(), _sessionExcludedVideo.end());
-    dispatch_async(_openQueue, ^{
+    _openQueue->async(^{
         if (gen != self->_openGeneration) return;
         self->_prepExcludedVideo = excludedSnapshot;
         int64_t tOpen0 = spNowUs();
@@ -2026,11 +2027,12 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         }
     }
 
-    dispatch_group_t grp = dispatch_group_create();
-    dispatch_queue_t bg = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-    dispatch_semaphore_t rendererConfigGate = dispatch_semaphore_create(0);
+    // Tasks capture these shared_ptrs, which keeps them alive as the captured
+    // dispatch group and semaphore were.
+    const auto grp = std::make_shared<sp::WaitGroup>();
+    const auto rendererConfigGate = std::make_shared<sp::Semaphore>(0);
     if (_renderer) {
-        dispatch_group_enter(grp);
+        grp->enter();
         [_renderer setColorimetryWithPrimaries:_preparedColorPrimaries
                                       transfer:_preparedColorTrc
                                     colorspace:_preparedColorSpace
@@ -2046,13 +2048,13 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                 self->_rendererConfiguredOpenGeneration.store(
                     openGen, std::memory_order_release);
             }
-            dispatch_semaphore_signal(rendererConfigGate);
-            dispatch_group_leave(grp);
+            rendererConfigGate->signal();
+            grp->leave();
         }];
     } else {
         // Defensive no-Metal path: do not strand the group/racer.  The ready
         // generation stays invalid and startPipeline fails closed below.
-        dispatch_semaphore_signal(rendererConfigGate);
+        rendererConfigGate->signal();
     }
 
     const AVPixFmtDescriptor *pfdSW = av_pix_fmt_desc_get((AVPixelFormat)par->format);
@@ -2084,7 +2086,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
     if (prepareSuperseded()) { [self discardFailedPrepare]; return kSPPrepErrOpenCancelled; }
     if (!forceSW) {
-        dispatch_group_async(grp, bg, ^{
+        sp::runInGroup(grp, sp::TaskQos::UserInitiated, ^{
             if (prepareSuperseded()) { vtRet = -1; return; }
             SPVideoDecoder *d = [[SPVideoDecoder alloc] init];
             d.spLogId = self->_spLogId;
@@ -2126,7 +2128,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 
         int64_t raceT0 = spNowUs();
 
-        dispatch_async(bg, ^{
+        sp::backgroundTasks().runAsync(sp::TaskQos::UserInitiated, ^{
             if (prepareSuperseded() || !racePar) {
                 AVPacket *tmp = kfPkt;
                 av_packet_free(&tmp);
@@ -2156,7 +2158,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                 // publication normally overlaps this decode.  The semaphore is
                 // always signalled (including cancellation/no renderer), and
                 // ensures the race never submits against the previous session.
-                dispatch_semaphore_wait(rendererConfigGate, DISPATCH_TIME_FOREVER);
+                rendererConfigGate->wait();
 
                 if (self->_openGeneration.load(std::memory_order_acquire) == openGen &&
                     self->_rendererConfiguredOpenGeneration.load(
@@ -2202,13 +2204,13 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
 
     _audioFallbackTrackApplied = NO;
-    dispatch_group_async(grp, bg, ^{
+    sp::runInGroup(grp, sp::TaskQos::UserInitiated, ^{
         if (prepareSuperseded()) return;
         [self prepareSubtitleWithContext:ctx];
         [self prepareAudioWithContext:ctx];
     });
 
-    dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+    grp->wait();
 
     if (_audioFallbackTrackApplied && !prepareSuperseded()) _preparedTrackSnapshot = [self buildTrackSnapshotsWithContext:ctx];
     if (prepareSuperseded()) {
@@ -2858,13 +2860,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     [self setState:SPPlayerStatePlaying];
     if (_audioOnlySession.load()) {
 
-        [_audioOnlyTimer invalidate];
-        _audioOnlyTimer = [NSTimer timerWithTimeInterval:0.25
-                                                  target:self
-                                                selector:@selector(audioOnlyTimerTick)
-                                                userInfo:nil
-                                                 repeats:YES];
-        [NSRunLoop.mainRunLoop addTimer:_audioOnlyTimer forMode:NSRunLoopCommonModes];
+        if (_audioOnlyTimer) _audioOnlyTimer->cancel();
+        // Every 250 ms. The handler holds self strongly until cancel(), as the
+        // NSTimer's target did.
+        _audioOnlyTimer = sp::mainThread().makeRepeatingTimer(250000, ^{ [self audioOnlyTimerTick]; });
     } else if (_displayLink) {
         _displayLink.paused = NO;
     }
@@ -3324,7 +3323,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     [self setState:SPPlayerStatePlaying];
     if (_displayLink) _displayLink.paused = NO;
 
-    if (_audioOnlyTimer) _audioOnlyTimer.fireDate = [NSDate date];
+    if (_audioOnlyTimer) _audioOnlyTimer->resumeNow();
     if (realignAudio) {
         if (spDebug()) SPLOG(@"[Step] 恢复播放：音频对齐 seek → %.3fs（步进领先 %.0fms）",
                              _lastPresentedPtsUs / 1e6, stepAheadUs / 1000.0);
@@ -3365,7 +3364,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     } else if (_displayLink) {
         _displayLink.paused = YES;
     }
-    if (_audioOnlyTimer) _audioOnlyTimer.fireDate = NSDate.distantFuture;
+    if (_audioOnlyTimer) _audioOnlyTimer->suspend();
     if (_audioOutput) [_audioOutput stop];
     [self setState:SPPlayerStatePaused];
 
@@ -3447,7 +3446,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         [self setState:SPPlayerStatePlaying];
         if (_displayLink) _displayLink.paused = NO;
 
-        if (_audioOnlyTimer) _audioOnlyTimer.fireDate = [NSDate date];
+        if (_audioOnlyTimer) _audioOnlyTimer->resumeNow();
     } else if (wasPaused) {
         [self armPausedSeekPresentation];
     }
@@ -4035,8 +4034,7 @@ static BOOL spThumbsEnabled(void) {
         });
     };
 
-    dispatch_async(dispatch_get_global_queue(
-                       silent ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0), ^{
+    sp::backgroundTasks().runAsync(silent ? sp::TaskQos::Utility : sp::TaskQos::UserInitiated, ^{
 
         const unsigned long long kSubCap = 32ull * 1024 * 1024;
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:pathCopy error:nil];
@@ -4253,7 +4251,7 @@ static NSString *spClaimScreenshotPath(NSString *base) {
     }
     CVPixelBufferRef snapshot = CVPixelBufferRetain(_lastFrameBuffer);
     NSString *pathCopy = [path copy];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    sp::backgroundTasks().runAsync(sp::TaskQos::Utility, ^{
         static CIContext *sCtx;
         static dispatch_once_t once;
         dispatch_once(&once, ^{ sCtx = [CIContext context]; });
@@ -4584,8 +4582,8 @@ static NSString *spCodecDisplayName(const std::string &name) {
     {
         std::lock_guard<std::mutex> renderFence(_renderMtx);
     }
-    [_audioOnlyTimer invalidate];
-    _audioOnlyTimer = nil;
+    if (_audioOnlyTimer) _audioOnlyTimer->cancel();
+    _audioOnlyTimer = nullptr;
     _mediaInfoSnapshot = nil;
     _hdrDescription = nil;
     _decoderNamePub = nil;
@@ -8382,7 +8380,7 @@ static void spApplyDecodeQoS() {
         if (_audioOutput) [_audioOutput stop];
         [self notifyPosition];
 
-        _audioOnlyTimer.fireDate = NSDate.distantFuture;
+        if (_audioOnlyTimer) _audioOnlyTimer->suspend();
     }
 }
 
@@ -8399,8 +8397,7 @@ static void spApplyDecodeQoS() {
     _pendingScanInFlight = YES;
     _pendingScanLastUs = now;
     if (!_pendingScanQueue)
-        _pendingScanQueue = dispatch_queue_create("sp.pendingScan",
-                                                  dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        _pendingScanQueue = sp::backgroundTasks().makeSerialQueue("sp.pendingScan", sp::TaskQos::Utility);
     std::shared_ptr<PendingScanJob> job = _demuxer->pendingScanJob();
     {
         std::lock_guard<std::mutex> lk(job->mapMtx);
@@ -8408,7 +8405,7 @@ static void spApplyDecodeQoS() {
     }
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     __weak SPPlayerCore *weakSelf = self;
-    dispatch_async(_pendingScanQueue, ^{
+    _pendingScanQueue->async(^{
         auto spans = std::make_shared<std::vector<std::pair<int64_t, int64_t>>>(spRunPendingScan(*job));
         sp::mainThread().post(^{
             SPPlayerCore *s = weakSelf;
@@ -8430,13 +8427,12 @@ static void spApplyDecodeQoS() {
     if (!job) return;
     _mkvContentScanStarted = YES;
     if (!_pendingScanQueue)
-        _pendingScanQueue = dispatch_queue_create("sp.pendingScan",
-                                                  dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        _pendingScanQueue = sp::backgroundTasks().makeSerialQueue("sp.pendingScan", sp::TaskQos::Utility);
     if (job->durationUs <= 0) job->durationUs = (int64_t)(_duration * 1e6);
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     __weak SPPlayerCore *weakSelf = self;
     if (spDebug()) SPLOG(@"[Resilient] 内容地图：后台预扫开始（%@）", [NSString stringWithUTF8String:job->path.c_str()].lastPathComponent);
-    dispatch_async(_pendingScanQueue, ^{
+    _pendingScanQueue->async(^{
         spRunMkvContentScan(*job, [weakSelf, og](std::vector<std::pair<int64_t, int64_t>> spans) {
             auto boxed = std::make_shared<std::vector<std::pair<int64_t, int64_t>>>(std::move(spans));
             sp::mainThread().post(^{
@@ -8528,17 +8524,19 @@ static void spApplyDecodeQoS() {
     _indexWaitStalled = _indexWaitPrepVerdict == IndexWaitVerdict::Stalled;
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     SPLOG(@"[Grow] 索引在文件末尾、文件还在下载：等索引到了再打开 %@", path.lastPathComponent);
-    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-    _indexWaitTimer = t;
     const std::string p = path.UTF8String;
     __weak SPPlayerCore *weakSelf = self;
-    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     __block BOOL sentStalled = _indexWaitStalled;
-    dispatch_source_set_event_handler(t, ^{
+    // The handler cancels its own timer when the wait ends; cancelling also
+    // releases the handler, as dispatch_source_cancel did.
+    const auto selfTimer = std::make_shared<sp::TimerSelfRef>();
+    // Every second, deferred by up to 100 ms, on a utility queue.
+    _indexWaitTimer = sp::backgroundTasks().makeRepeatingTimer(sp::TaskQos::Utility, 1000000, 1000000, 100000, ^{
         const IndexWaitVerdict v = spProbeIndexWait(p, *state);
         const bool done = v == IndexWaitVerdict::Ready || v == IndexWaitVerdict::Finished || v == IndexWaitVerdict::NotWritten;
-        if (done) dispatch_source_cancel(t);
+        if (done) {
+            selfTimer->cancel();
+        }
         const BOOL nowStalled = v == IndexWaitVerdict::Stalled;
         if (!done && nowStalled == sentStalled) return;
         sentStalled = nowStalled;
@@ -8559,13 +8557,13 @@ static void spApplyDecodeQoS() {
                 [s->_delegate playerCoreDidChangeSourceGrowth:s];
         });
     });
-    dispatch_resume(t);
+    selfTimer->set(_indexWaitTimer);
 }
 
 - (void)cancelIndexWait {
     if (_indexWaitTimer) {
-        dispatch_source_cancel(_indexWaitTimer);
-        _indexWaitTimer = nil;
+        _indexWaitTimer->cancel();
+        _indexWaitTimer = nullptr;
     }
     _indexWaiting = NO;
     _indexWaitStalled = NO;
@@ -10228,8 +10226,10 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 #pragma mark - Decoder prewarming
 
 extern "C" void SPPrewarmVideoDecoders(void) {
+    // Called from main.swift at launch, before SPPlayerCore may have been used.
+    SPInstallDispatchExecutors();
     if (gVtWarmIssued.exchange(true)) return;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    sp::backgroundTasks().runAsync(sp::TaskQos::Utility, ^{
         if (gRealOpenIssued.load()) return;
         int64_t t0 = spNowUs();
         [SPVideoDecoder warmUpDecoderForCodecID:AV_CODEC_ID_H264];

@@ -10,6 +10,8 @@ add_library(khua_media_portable STATIC
     Core/Platform/SPThreadWin32.cpp
     Core/Demuxer.cpp
     Core/Player/SPExecutor.cpp
+    Core/Player/SPTasks.cpp
+    Core/Player/SPThreadTasks.cpp
     Core/TsRapScan.cpp
     Bridge/SPDoviRPU.cpp
     Bridge/SPFrameSelectionPolicy.cpp
