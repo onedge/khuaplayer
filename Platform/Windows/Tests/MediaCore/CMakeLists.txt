@@ -46,7 +46,9 @@ set(KHUA_PORTABLE_HEADERS
     Core/Resilience/ResilienceOpenDiagnosis.hpp
     Core/Resilience/ResilienceVideoCodec.hpp
     Bridge/SPAnnexBStartCode.hpp
+    Bridge/SPAudioChannelMap.hpp
     Bridge/SPAudioPeak.hpp
+    Bridge/SPColorMetadata.hpp
     Bridge/SPAv1CatchUpSkip.hpp
     Bridge/SPContentCoverage.hpp
     Bridge/SPDoviRPU.hpp
@@ -81,6 +83,7 @@ target_link_libraries(khua_header_check PRIVATE khua_media_portable)
 
 add_executable(khua_mediacore_tests
     AnnexBStartCodeTests.cpp
+    ColorAndChannelTests.cpp
     DemuxerTests.cpp
     FFmpegConfigurationTests.cpp
     FileSystemTests.cpp

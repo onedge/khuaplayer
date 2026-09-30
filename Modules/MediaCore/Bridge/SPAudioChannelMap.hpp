@@ -3,9 +3,39 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#if defined(__APPLE__)
 #include <CoreAudioTypes/CoreAudioTypes.h>
+#endif
 
 namespace sp {
+
+// Device channel labels. The values are CoreAudio's AudioChannelLabel
+// constants, so a macOS device's channel layout can be passed through
+// unchanged; the Windows output translates its SPEAKER_* positions into them.
+enum SPSpeakerLabel : uint32_t {
+    kSPSpeakerLeft = 1,
+    kSPSpeakerRight = 2,
+    kSPSpeakerCenter = 3,
+    kSPSpeakerLFE = 4,
+    kSPSpeakerLeftSurround = 5,
+    kSPSpeakerRightSurround = 6,
+    kSPSpeakerLeftSurroundDirect = 10,
+    kSPSpeakerRightSurroundDirect = 11,
+    kSPSpeakerRearSurroundLeft = 33,
+    kSPSpeakerRearSurroundRight = 34,
+};
+#if defined(__APPLE__)
+static_assert(kSPSpeakerLeft == kAudioChannelLabel_Left);
+static_assert(kSPSpeakerRight == kAudioChannelLabel_Right);
+static_assert(kSPSpeakerCenter == kAudioChannelLabel_Center);
+static_assert(kSPSpeakerLFE == kAudioChannelLabel_LFEScreen);
+static_assert(kSPSpeakerLeftSurround == kAudioChannelLabel_LeftSurround);
+static_assert(kSPSpeakerRightSurround == kAudioChannelLabel_RightSurround);
+static_assert(kSPSpeakerLeftSurroundDirect == kAudioChannelLabel_LeftSurroundDirect);
+static_assert(kSPSpeakerRightSurroundDirect == kAudioChannelLabel_RightSurroundDirect);
+static_assert(kSPSpeakerRearSurroundLeft == kAudioChannelLabel_RearSurroundLeft);
+static_assert(kSPSpeakerRearSurroundRight == kAudioChannelLabel_RearSurroundRight);
+#endif
 
 enum : uint64_t {
     kSPChFL  = 1ull << 0,  kSPChFR  = 1ull << 1,  kSPChFC  = 1ull << 2,
@@ -62,16 +92,16 @@ inline bool resolveOutputLayout(const uint32_t *labels, int count, AudioOutputLa
     const int n = count < kSPAudioMaxDeviceChannels ? count : kSPAudioMaxDeviceChannels;
     for (int i = 0; i < n; i++) {
         switch (labels[i]) {
-            case kAudioChannelLabel_Left:                if (fl  < 0) fl  = i; break;
-            case kAudioChannelLabel_Right:               if (fr  < 0) fr  = i; break;
-            case kAudioChannelLabel_Center:              if (fc  < 0) fc  = i; break;
-            case kAudioChannelLabel_LFEScreen:           if (lfe < 0) lfe = i; break;
-            case kAudioChannelLabel_LeftSurround:        if (ls  < 0) ls  = i; break;
-            case kAudioChannelLabel_RightSurround:       if (rs  < 0) rs  = i; break;
-            case kAudioChannelLabel_LeftSurroundDirect:  if (lsd < 0) lsd = i; break;
-            case kAudioChannelLabel_RightSurroundDirect: if (rsd < 0) rsd = i; break;
-            case kAudioChannelLabel_RearSurroundLeft:    if (rls < 0) rls = i; break;
-            case kAudioChannelLabel_RearSurroundRight:   if (rrs < 0) rrs = i; break;
+            case kSPSpeakerLeft:                if (fl  < 0) fl  = i; break;
+            case kSPSpeakerRight:               if (fr  < 0) fr  = i; break;
+            case kSPSpeakerCenter:              if (fc  < 0) fc  = i; break;
+            case kSPSpeakerLFE:                 if (lfe < 0) lfe = i; break;
+            case kSPSpeakerLeftSurround:        if (ls  < 0) ls  = i; break;
+            case kSPSpeakerRightSurround:       if (rs  < 0) rs  = i; break;
+            case kSPSpeakerLeftSurroundDirect:  if (lsd < 0) lsd = i; break;
+            case kSPSpeakerRightSurroundDirect: if (rsd < 0) rsd = i; break;
+            case kSPSpeakerRearSurroundLeft:    if (rls < 0) rls = i; break;
+            case kSPSpeakerRearSurroundRight:   if (rrs < 0) rrs = i; break;
             default: break;
         }
     }

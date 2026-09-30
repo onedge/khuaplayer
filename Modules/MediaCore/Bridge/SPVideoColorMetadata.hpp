@@ -2,9 +2,7 @@
 
 #import <CoreVideo/CoreVideo.h>
 
-extern "C" {
-#include <libavutil/pixfmt.h>
-}
+#include "SPColorMetadata.hpp"
 
 namespace sp {
 
@@ -12,15 +10,7 @@ namespace sp {
 // descriptions and FFmpeg-created pixel buffers must use the same tags: VT
 // does not reliably recover VUI colorimetry on its own, while Core Image needs
 // these attachments to interpret software-decoded YUV surfaces correctly.
-// A stream declaration is authoritative even when CoreVideo has no equivalent
-// tag for it. Only AVCOL_*_UNSPECIFIED delegates that individual field to the
-// decoded frame; an unsupported explicit stream value must not be silently
-// replaced by a frame value with different semantics.
-inline constexpr int spAuthoritativeColorValue(int streamValue,
-                                                int frameValue,
-                                                int unspecifiedValue) {
-    return streamValue != unspecifiedValue ? streamValue : frameValue;
-}
+// Stream values are resolved with spAuthoritativeColorValue.
 
 inline CFStringRef spCVColorPrimaries(int value) {
     switch (value) {
@@ -51,38 +41,6 @@ inline CFStringRef spCVTransferFunction(int value) {
     }
 }
 
-enum : int {
-    kSPTransferBT709  = 0,
-    kSPTransferPQ     = 1, // SMPTE ST 2084
-    kSPTransferHLG    = 2, // ARIB STD-B67
-    kSPTransferLinear = 3,
-    kSPTransferSRGB   = 4, // IEC 61966-2-1
-    kSPTransferGamma22 = 5,
-    kSPTransferGamma28 = 6,
-    kSPTransferST428   = 7,
-};
-
-struct SPRendererTransfer {
-    int index;
-    bool hdr;
-
-    constexpr bool operator==(const SPRendererTransfer &) const = default;
-};
-
-inline constexpr SPRendererTransfer spRendererTransferForAVTrc(int trc) {
-    switch (trc) {
-        case AVCOL_TRC_SMPTE2084:    return { kSPTransferPQ,     true  };
-        case AVCOL_TRC_ARIB_STD_B67: return { kSPTransferHLG,    true  };
-        case AVCOL_TRC_LINEAR:       return { kSPTransferLinear, false };
-        case AVCOL_TRC_IEC61966_2_1: return { kSPTransferSRGB,   false };
-        case AVCOL_TRC_GAMMA22:      return { kSPTransferGamma22, false };
-        case AVCOL_TRC_GAMMA28:      return { kSPTransferGamma28, false };
-        case AVCOL_TRC_SMPTE428:     return { kSPTransferST428,   false };
-
-        default:                     return { kSPTransferBT709,  false };
-    }
-}
-
 inline SPRendererTransfer spRendererTransferForCVTrc(CFStringRef trc) {
     if (!trc) return { kSPTransferBT709, false };
     if (CFEqual(trc, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ))
@@ -99,33 +57,6 @@ inline SPRendererTransfer spRendererTransferForCVTrc(CFStringRef trc) {
     return { kSPTransferBT709, false };
 }
 
-enum SPRendererSourceGamut : int {
-    kSPGamutBT709  = 0,
-    kSPGamutBT2020 = 1,
-    kSPGamutSMPTEC = 2, // SMPTE 170M / 240M（NTSC）
-    kSPGamutEBU    = 3, // BT.470BG / EBU Tech 3213（PAL）
-    kSPGamutP3     = 4, // P3-D65（SMPTE 432）
-    kSPGamutDCIP3  = 5,
-};
-
-inline constexpr int spRendererSourceGamutForAV(int primaries, int matrix) {
-    switch (primaries) {
-        case AVCOL_PRI_BT2020:    return kSPGamutBT2020;
-        case AVCOL_PRI_SMPTE170M:
-        case AVCOL_PRI_SMPTE240M: return kSPGamutSMPTEC;
-        case AVCOL_PRI_BT470BG:   return kSPGamutEBU;
-        case AVCOL_PRI_SMPTE432:  return kSPGamutP3;
-        case AVCOL_PRI_SMPTE431:  return kSPGamutDCIP3;
-        case AVCOL_PRI_BT709:     return kSPGamutBT709;
-        default: break;
-    }
-    const bool declared = primaries > 0 && primaries != AVCOL_PRI_UNSPECIFIED;
-    if (!declared && (matrix == AVCOL_SPC_BT2020_NCL || matrix == AVCOL_SPC_BT2020_CL)) {
-        return kSPGamutBT2020;
-    }
-    return kSPGamutBT709;
-}
-
 inline int spRendererSourceGamutForCV(CFStringRef primaries) {
     if (!primaries) return kSPGamutBT709;
     if (CFEqual(primaries, kCVImageBufferColorPrimaries_ITU_R_2020)) return kSPGamutBT2020;
@@ -135,16 +66,6 @@ inline int spRendererSourceGamutForCV(CFStringRef primaries) {
     if (CFEqual(primaries, kCVImageBufferColorPrimaries_DCI_P3))     return kSPGamutDCIP3;
     return kSPGamutBT709;
 }
-
-inline constexpr int spSDRLayerTagKey(int sourceGamut, int transfer, bool hasHdr) {
-    return hasHdr ? 0 : 1 + (sourceGamut & 7) + (transfer & 0xF) * 8;
-}
-inline constexpr int spSDRLayerTagKeyGamut(int key) { return (key - 1) & 7; }
-inline constexpr int spSDRLayerTagKeyTransfer(int key) { return (key - 1) >> 3; }
-static_assert(spSDRLayerTagKey(kSPGamutBT709, kSPTransferBT709, false) == 1);
-static_assert(spSDRLayerTagKey(kSPGamutBT2020, kSPTransferPQ, true) == 0);
-static_assert(spSDRLayerTagKeyGamut(spSDRLayerTagKey(kSPGamutDCIP3, kSPTransferGamma28, false)) == kSPGamutDCIP3);
-static_assert(spSDRLayerTagKeyTransfer(spSDRLayerTagKey(kSPGamutDCIP3, kSPTransferGamma28, false)) == kSPTransferGamma28);
 
 inline CFStringRef spCVColorPrimariesForGamut(int gamut) {
     switch (gamut) {
@@ -169,10 +90,6 @@ inline CFStringRef spCVTransferFunctionForTransfer(int transfer) {
         default:                 return kCVImageBufferTransferFunction_ITU_R_709_2;
     }
 }
-inline constexpr double spCVGammaLevelForTransfer(int transfer) {
-    return transfer == kSPTransferGamma22 ? 2.2 : transfer == kSPTransferGamma28 ? 2.8 : 0.0;
-}
-
 inline CFStringRef spCVYCbCrMatrix(int value) {
     switch (value) {
         case AVCOL_SPC_BT709:      return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
