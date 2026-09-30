@@ -1,6 +1,8 @@
 # Build products (the root-level .app remains available locally but is not committed)
 .build/
 build/
+# Local Python virtual environment for the repository scripts
+.venv/
 # Numbered copies created by Finder's "Keep Both" action (for example,
 # Khua 2.app). Unregister them with lsregister before deletion to avoid
 # duplicate entries in the Finder "Open With" menu.

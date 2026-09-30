@@ -1,0 +1,5 @@
+{
+  "overlay-ports": [
+    "Platform/Windows/vcpkg/ports"
+  ]
+}

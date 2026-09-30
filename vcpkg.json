@@ -1,0 +1,35 @@
+{
+  "$comment": "Windows dependency manifest. Versions follow ThirdParty/deps.lock.json; FFmpeg comes from the overlay port in Platform/Windows/vcpkg/ports, which carries the same patches as Scripts/patches. LGPL only: never enable the gpl or nonfree features.",
+  "name": "khua-player",
+  "version-string": "0.0.0",
+  "builtin-baseline": "4cb050be2cfa7a947cdd2dd1a70e24b17774c979",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "bzip2",
+        "dav1d",
+        "speex",
+        "swresample",
+        "swscale",
+        "zlib"
+      ]
+    },
+    "zlib"
+  ],
+  "features": {
+    "tests": {
+      "description": "Portable media-core unit tests",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  },
+  "overrides": [
+    { "name": "dav1d", "version": "1.5.1" },
+    { "name": "speex", "version": "1.2.1" }
+  ]
+}
