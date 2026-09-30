@@ -7,6 +7,7 @@ set(KHUA_MEDIACORE_DIR ${PROJECT_SOURCE_DIR}/Platform/Windows/MediaCore)
 # Apple frameworks are listed in Platform/Windows/README.md and join this list
 # once they no longer do.
 set(KHUA_PORTABLE_HEADERS
+    Core/Audio/SPAudioEngine.hpp
     Core/BoundedQueue.hpp
     Core/Demuxer.hpp
     Core/MatroskaCuesLocator.hpp
@@ -89,6 +90,7 @@ target_link_libraries(khua_header_check PRIVATE khua_media_portable)
 
 add_executable(khua_mediacore_tests
     AnnexBStartCodeTests.cpp
+    AudioEngineTests.cpp
     AudioSinkTests.cpp
     ColorAndChannelTests.cpp
     DemuxerTests.cpp
@@ -101,6 +103,7 @@ add_executable(khua_mediacore_tests
     ThreadTests.cpp
     TsRapPolicyTests.cpp
     VideoFrameTests.cpp
+    WasapiAudioSinkTests.cpp
 )
 target_link_libraries(khua_mediacore_tests
     PRIVATE

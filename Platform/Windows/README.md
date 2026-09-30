@@ -81,5 +81,6 @@ re-copying the patch.
 | `Core/Platform` | Win32 file handles (overlapped, fully shared so downloads continue and can be renamed), positional reads, stat, current path, local/remote volume, sparse ranges, writer detection, thread names and priorities, and cancelling a blocked read with `CancelIoEx`/`CancelSynchronousIo`. Errors are errno values. Paths beyond `MAX_PATH` need the app's `longPathAware` manifest setting |
 | `Core/Player` | UI-thread executor, background tasks (std::thread), `WaitGroup`/`Semaphore`, `VideoFrameRef`, `PlayerListener`/`PlayerError`, and `AudioSink`/`AudioSinkRef`: the interfaces the Windows player core is written against |
 | Player core | Not yet: to be written in C++ from `SPPlayerCore.mm` |
-| Output | Not yet: D3D11 renderer and HLSL shaders, WASAPI audio sink, D3D11VA decoding |
+| `Core/Audio` | `AudioEngine`, the logic of the Mac `SPAudioOutput.mm` without the AudioUnit: 48 kHz ring, epochs, pitch-preserving rate changes that regenerate queued audio, gain ramp, limiter and the media clock |
+| Output | WASAPI audio sink (shared mode, event driven, 5.1/7.1 from the endpoint's mix format, follows default-device changes); the clock counts only what the endpoint has played and holds across pause. Not yet: D3D11 renderer and HLSL shaders, D3D11VA decoding |
 | App | Not yet: C ABI DLL and WinUI 3 app |

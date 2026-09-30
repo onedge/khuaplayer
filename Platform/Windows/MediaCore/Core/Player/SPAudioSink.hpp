@@ -23,7 +23,8 @@ public:
     virtual int outputChannels() = 0;
     virtual bool outputLayoutChangePending() = 0;
     virtual bool applyPendingOutputLayout() = 0;
-    // Called when the device layout changes; may run on any thread.
+    // Called when the device layout changes, on any thread but the one that
+    // renders audio. It may call back into the sink and wait.
     virtual void setOutputLayoutChangeHandler(std::function<void()> handler) = 0;
     virtual std::string outputLayoutDescription() = 0;
     virtual std::string outputLayoutName() = 0;

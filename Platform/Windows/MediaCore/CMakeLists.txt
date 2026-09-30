@@ -10,8 +10,10 @@ add_library(khua_media_portable STATIC
     Core/Player/SPExecutor.cpp
     Core/Player/SPTasks.cpp
     Core/Player/SPThreadTasks.cpp
+    Core/Audio/SPAudioEngine.cpp
     Core/Demuxer.cpp
     Core/TsRapScan.cpp
+    Output/SPWasapiAudioSink.cpp
     Bridge/SPDoviRPU.cpp
     Bridge/SPFrameSelectionPolicy.cpp
     Bridge/SPSubtitleCompositor.cpp
@@ -21,6 +23,7 @@ target_include_directories(khua_media_portable
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Core
         ${CMAKE_CURRENT_SOURCE_DIR}/Bridge
+        ${CMAKE_CURRENT_SOURCE_DIR}/Output
         ${FFMPEG_INCLUDE_DIRS}
 )
 
@@ -28,6 +31,9 @@ target_link_libraries(khua_media_portable
     PUBLIC
         ${FFMPEG_LIBRARIES}
         ZLIB::ZLIB
+        # WASAPI output: COM activation and MMCSS thread priority.
+        ole32
+        avrt
 )
 
 # Matches GCC_PREPROCESSOR_DEFINITIONS in Apps/Mac/project.yml.
