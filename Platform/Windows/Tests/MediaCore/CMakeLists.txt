@@ -29,6 +29,7 @@ set(KHUA_PORTABLE_HEADERS
     Core/Player/SPExecutor.hpp
     Core/Player/SPSync.hpp
     Core/Player/SPTasks.hpp
+    Core/Player/SPVideoFrame.hpp
     Core/Recovery/RecoveryAsfRm.hpp
     Core/Recovery/RecoveryAvi.hpp
     Core/Recovery/RecoveryBase.hpp
@@ -96,6 +97,8 @@ add_executable(khua_mediacore_tests
     TasksTests.cpp
     ThreadTests.cpp
     TsRapPolicyTests.cpp
+    VideoFrameBridgeTests.cpp
+    VideoFrameTests.cpp
 )
 target_link_libraries(khua_mediacore_tests
     PRIVATE

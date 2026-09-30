@@ -3,6 +3,8 @@
 #include "Player/SPExecutor.hpp"
 #include "Player/SPSync.hpp"
 #include "Player/SPTasks.hpp"
+#define SP_VIDEO_FRAME_CV_BRIDGE 1
+#include "Player/SPVideoFrame.hpp"
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -108,7 +110,7 @@ private:
 // is negligible at a queue depth of at most 20, while a separate dispatch method
 // preserves the Off hot-path behavior.
 struct DecodedFrame {
-    CVPixelBufferRef buffer = NULL;
+    sp::VideoFrameRef buffer;
     int64_t ptsUs = 0;
     int64_t gen = 0;
     bool synthetic = false;
@@ -816,12 +818,12 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     double _volume;                 // Software gain 0~5 (UI percentage / 100)
     BOOL _muted;
     double _loopA, _loopB;
-    CVPixelBufferRef _lastFrameBuffer;
+    sp::VideoFrameRef _lastFrameBuffer;
 
     int64_t _frameStepAheadUs;
 
     std::atomic<bool> _motionCompareEnabled;
-    CVPixelBufferRef _compareRealFrame;
+    sp::VideoFrameRef _compareRealFrame;
     int64_t _compareRealFrameGen;
     bool _rendererCompareActive;
     std::atomic<bool> _seekFramePending;
@@ -1641,10 +1643,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 
     _videoPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
     _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
-    _frames->drain([](DecodedFrame f) { if (f.buffer) CVPixelBufferRelease(f.buffer); });
+    _frames->drain([](DecodedFrame f) { if (f.buffer) sp::spFrameRelease(f.buffer); });
     if (auto motionFrames = _motionFramesPublished.exchange(nullptr)) {
         motionFrames->drain([](DecodedFrame f) {
-            if (f.buffer) CVPixelBufferRelease(f.buffer);
+            if (f.buffer) sp::spFrameRelease(f.buffer);
         });
         spFrameQueueRelease(&_motionQueueClaimBytes);
     }
@@ -2405,7 +2407,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         }
         if (auto motionFrames = _motionFramesPublished.exchange(nullptr)) {
             motionFrames->drain([](DecodedFrame f) {
-                if (f.buffer) CVPixelBufferRelease(f.buffer);
+                if (f.buffer) sp::spFrameRelease(f.buffer);
             });
             spFrameQueueRelease(&_motionQueueClaimBytes);
         }
@@ -3812,7 +3814,7 @@ static BOOL spThumbsEnabled(void) {
     [self notifyFrameInterpolationDidChange];
     if (mode == SPFrameInterpolationModeOff) {
 
-        if (_compareRealFrame) { CVPixelBufferRelease(_compareRealFrame); _compareRealFrame = NULL; }
+        if (_compareRealFrame) { sp::spFrameRelease(_compareRealFrame); _compareRealFrame = NULL; }
         _compareRealFrameGen = -1;
         if (_rendererCompareActive) { [_renderer setCompareBuffer:NULL]; _rendererCompareActive = false; }
     }
@@ -4249,7 +4251,7 @@ static NSString *spClaimScreenshotPath(NSString *base) {
         if (completion) completion(NO, path);
         return;
     }
-    CVPixelBufferRef snapshot = CVPixelBufferRetain(_lastFrameBuffer);
+    CVPixelBufferRef snapshot = sp::spFrameRetain(_lastFrameBuffer);
     NSString *pathCopy = [path copy];
     sp::backgroundTasks().runAsync(sp::TaskQos::Utility, ^{
         static CIContext *sCtx;
@@ -4607,11 +4609,11 @@ static NSString *spCodecDisplayName(const std::string &name) {
 
         _videoPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
         _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
-        _frames->drain([](DecodedFrame f) { if (f.buffer) CVPixelBufferRelease(f.buffer); });
+        _frames->drain([](DecodedFrame f) { if (f.buffer) sp::spFrameRelease(f.buffer); });
         spFrameQueueRelease(&_framesQueueClaimBytes);
         if (auto motionFrames = _motionFramesPublished.exchange(nullptr)) {
             motionFrames->drain([](DecodedFrame f) {
-                if (f.buffer) CVPixelBufferRelease(f.buffer);
+                if (f.buffer) sp::spFrameRelease(f.buffer);
             });
             spFrameQueueRelease(&_motionQueueClaimBytes);
         }
@@ -4685,8 +4687,8 @@ static NSString *spCodecDisplayName(const std::string &name) {
         _audioParFixPending.store(false, std::memory_order_relaxed);
     }
 
-    if (_lastFrameBuffer) { CVPixelBufferRelease(_lastFrameBuffer); _lastFrameBuffer = NULL; }
-    if (_compareRealFrame) { CVPixelBufferRelease(_compareRealFrame); _compareRealFrame = NULL; }
+    if (_lastFrameBuffer) { sp::spFrameRelease(_lastFrameBuffer); _lastFrameBuffer = NULL; }
+    if (_compareRealFrame) { sp::spFrameRelease(_compareRealFrame); _compareRealFrame = NULL; }
     _compareRealFrameGen = -1;
     if (_rendererCompareActive) { [_renderer setCompareBuffer:NULL]; _rendererCompareActive = false; }
     _presentRetryPending = NO;
@@ -4696,12 +4698,12 @@ static NSString *spCodecDisplayName(const std::string &name) {
     _lastFrameInterpolationEpoch = 0;
     _videoPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
     _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
-    _frames->drain([](DecodedFrame f) { if (f.buffer) CVPixelBufferRelease(f.buffer); });
+    _frames->drain([](DecodedFrame f) { if (f.buffer) sp::spFrameRelease(f.buffer); });
 
     spFrameQueueRelease(&_framesQueueClaimBytes);
     if (auto motionFrames = _motionFramesPublished.exchange(nullptr)) {
         motionFrames->drain([](DecodedFrame f) {
-            if (f.buffer) CVPixelBufferRelease(f.buffer);
+            if (f.buffer) sp::spFrameRelease(f.buffer);
         });
         spFrameQueueRelease(&_motionQueueClaimBytes);
     }
@@ -6096,7 +6098,7 @@ static void spApplyDecodeQoS() {
                 auto *droppedCounter = &_generator.counters->dropped;
                 motionFrames->drain([droppedCounter](DecodedFrame f) {
                     if (f.synthetic) droppedCounter->fetch_add(1);
-                    if (f.buffer) CVPixelBufferRelease(f.buffer);
+                    if (f.buffer) sp::spFrameRelease(f.buffer);
                 });
             }
         }
@@ -6140,7 +6142,7 @@ static void spApplyDecodeQoS() {
         if (mode == SPFrameInterpolationModeDoubleRate && motionFrames) {
 
             motionFrames->drain([](DecodedFrame f) {
-                if (f.buffer) CVPixelBufferRelease(f.buffer);
+                if (f.buffer) sp::spFrameRelease(f.buffer);
             });
             self->_frames->drain([self, motionFrames](DecodedFrame f) {
                 DecodedFrame moved;
@@ -6151,7 +6153,7 @@ static void spApplyDecodeQoS() {
 #if DEBUG && !SP_APP_STORE
 
 #endif
-                    CVPixelBufferRelease(f.buffer);
+                    sp::spFrameRelease(f.buffer);
                 }
             });
         } else if (motionFrames) {
@@ -6160,7 +6162,7 @@ static void spApplyDecodeQoS() {
             motionFrames->drain([self, droppedCounter](DecodedFrame f) {
                 if (f.synthetic) {
                     droppedCounter->fetch_add(1);
-                    if (f.buffer) CVPixelBufferRelease(f.buffer);
+                    if (f.buffer) sp::spFrameRelease(f.buffer);
                     return;
                 }
                 DecodedFrame moved = f;
@@ -6170,7 +6172,7 @@ static void spApplyDecodeQoS() {
 #if DEBUG && !SP_APP_STORE
 
 #endif
-                    CVPixelBufferRelease(f.buffer);
+                    sp::spFrameRelease(f.buffer);
                 }
             });
 
@@ -7157,8 +7159,8 @@ static void spApplyDecodeQoS() {
     if (!frame.synthetic &&
         _frameInterpolationCommittedModeValue.load() != SPFrameInterpolationModeOff) {
 
-        if (_compareRealFrame) CVPixelBufferRelease(_compareRealFrame);
-        _compareRealFrame = CVPixelBufferRetain(frame.buffer);
+        if (_compareRealFrame) sp::spFrameRelease(_compareRealFrame);
+        _compareRealFrame = sp::spFrameRetain(frame.buffer);
         _compareRealFrameGen = frame.gen;
     }
     if (_rendererCompareActive || frame.synthetic) {
@@ -7182,8 +7184,8 @@ static void spApplyDecodeQoS() {
                                                 std::memory_order_release);
         }
     }
-    if (_lastFrameBuffer) CVPixelBufferRelease(_lastFrameBuffer);
-    _lastFrameBuffer = CVPixelBufferRetain(frame.buffer);
+    if (_lastFrameBuffer) sp::spFrameRelease(_lastFrameBuffer);
+    _lastFrameBuffer = sp::spFrameRetain(frame.buffer);
     _lastFrameGeneration = frame.gen;
     _lastFrameSynthetic = frame.synthetic;
     _lastFrameInterpolationEpoch = frame.interpolationEpoch;
@@ -7243,11 +7245,11 @@ static void spApplyDecodeQoS() {
         if (decision.action != SPFrameSelectionAction::Select) {
 
             if (f.synthetic) _generator.counters->dropped.fetch_add(1);
-            CVPixelBufferRelease(f.buffer);
+            sp::spFrameRelease(f.buffer);
             continue;
         }
         [self presentDecodedFrame:f];
-        CVPixelBufferRelease(f.buffer);
+        sp::spFrameRelease(f.buffer);
         finishFirstFrame(f.ptsUs);
         return;
     }
@@ -7888,14 +7890,14 @@ static void spApplyDecodeQoS() {
             spEvaluateStepFrame(spFrameMetadata(f), context);
         if (decision.action != SPFrameSelectionAction::Select) {
 
-            CVPixelBufferRelease(f.buffer);
+            sp::spFrameRelease(f.buffer);
             continue;
         }
         const int64_t prevPtsUs = _lastPresentedPtsUs;
 
         [_subtitleRenderer forceNextSample];
         const BOOL submitted = [self presentDecodedFrame:f];
-        CVPixelBufferRelease(f.buffer);
+        sp::spFrameRelease(f.buffer);
         if (!submitted) {
 
             _presentRetryCompletesPausedSeek = YES;
@@ -7946,7 +7948,7 @@ static void spApplyDecodeQoS() {
                 SPFrameSelectionAction::DropBeforeSeekBurst) {
 
             if (f.synthetic) _generator.counters->dropped.fetch_add(1);
-            CVPixelBufferRelease(f.buffer);
+            sp::spFrameRelease(f.buffer);
             continue;
         }
         _seekFlashDone.store(true);
@@ -7967,7 +7969,7 @@ static void spApplyDecodeQoS() {
             [_subtitleRenderer forceNextSample];
         }
         BOOL submitted = [self presentDecodedFrame:f];
-        CVPixelBufferRelease(f.buffer);
+        sp::spFrameRelease(f.buffer);
         [self noteFramePresentedForCoarseLanding:f.gen ptsUs:f.ptsUs submitted:submitted];
 
         if (settlement.settles) {
@@ -8224,12 +8226,12 @@ static void spApplyDecodeQoS() {
                     spEvaluateImmediateFrame(spFrameMetadata(f), context);
                 if (decision.action != SPFrameSelectionAction::Select) {
                     if (f.synthetic) _generator.counters->dropped.fetch_add(1);
-                    CVPixelBufferRelease(f.buffer);
+                    sp::spFrameRelease(f.buffer);
                     continue;
                 }
                 [_subtitleRenderer forceNextSample];
                 BOOL submitted = [self presentDecodedFrame:f];
-                CVPixelBufferRelease(f.buffer);
+                sp::spFrameRelease(f.buffer);
                 [self noteFramePresentedForCoarseLanding:f.gen ptsUs:f.ptsUs submitted:submitted];
                 _seekPending.store(!submitted);
                 _presentRetryCompletesPausedSeek = !submitted;
@@ -8303,7 +8305,7 @@ static void spApplyDecodeQoS() {
                 decision.action ==
                     SPFrameSelectionAction::DropBeforeSeekTarget) {
                 if (f.synthetic) _generator.counters->dropped.fetch_add(1);
-                CVPixelBufferRelease(f.buffer);
+                sp::spFrameRelease(f.buffer);
                 continue;
             }
             if (decision.reachesSeekTarget) {
@@ -8311,7 +8313,7 @@ static void spApplyDecodeQoS() {
             }
             if (got) {
                 if (selectedFrame.synthetic) _generator.counters->dropped.fetch_add(1);
-                CVPixelBufferRelease(selectedFrame.buffer);
+                sp::spFrameRelease(selectedFrame.buffer);
                 _paceDropped++;
                 _lateDropCounter.fetch_add(1, std::memory_order_relaxed);
 
@@ -8850,7 +8852,7 @@ static void spApplyDecodeQoS() {
                 _pacePrevCommitSynthetic = committedSynthetic;
             }
         }
-        CVPixelBufferRelease(selected.buffer);
+        sp::spFrameRelease(selected.buffer);
         _seekPending.store(false);
         [self noteFramePresentedForCoarseLanding:selected.gen ptsUs:selected.ptsUs
                                        submitted:submitted];
@@ -8960,13 +8962,13 @@ static void spApplyDecodeQoS() {
     _videoPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
     _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
     _frames->drain([](DecodedFrame f) {
-        if (f.buffer) CVPixelBufferRelease(f.buffer);
+        if (f.buffer) sp::spFrameRelease(f.buffer);
     });
     if (auto motionFrames = _motionFramesPublished.load()) {
         auto *droppedCounter = &_generator.counters->dropped;
         motionFrames->drain([droppedCounter](DecodedFrame f) {
             if (f.synthetic) droppedCounter->fetch_add(1);
-            if (f.buffer) CVPixelBufferRelease(f.buffer);
+            if (f.buffer) sp::spFrameRelease(f.buffer);
         });
     }
 }
@@ -9023,8 +9025,8 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     if (_presentRetryPending && _lastFrameSynthetic) {
         _generator.counters->dropped.fetch_add(1);
     }
-    if (_lastFrameBuffer) { CVPixelBufferRelease(_lastFrameBuffer); _lastFrameBuffer = NULL; }
-    if (_compareRealFrame) { CVPixelBufferRelease(_compareRealFrame); _compareRealFrame = NULL; }
+    if (_lastFrameBuffer) { sp::spFrameRelease(_lastFrameBuffer); _lastFrameBuffer = NULL; }
+    if (_compareRealFrame) { sp::spFrameRelease(_compareRealFrame); _compareRealFrame = NULL; }
     _compareRealFrameGen = -1;
     if (_rendererCompareActive) { [_renderer setCompareBuffer:NULL]; _rendererCompareActive = false; }
     _presentRetryPending = NO;
