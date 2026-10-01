@@ -27,6 +27,7 @@ set(KHUA_PORTABLE_HEADERS
     Core/Platform/SPFileSystem.hpp
     Core/Platform/SPThread.hpp
     Core/Platform/SPWin32.hpp
+    Core/Player/SPAVFrameRef.hpp
     Core/Player/SPAudioSink.hpp
     Core/Player/SPExecutor.hpp
     Core/Player/SPPlayerListener.hpp
@@ -98,6 +99,7 @@ add_executable(khua_mediacore_tests
     FFmpegConfigurationTests.cpp
     FileSystemTests.cpp
     FrameSelectionPolicyTests.cpp
+    RendererTests.cpp
     SubtitleCompositorTests.cpp
     TasksTests.cpp
     ThreadTests.cpp
