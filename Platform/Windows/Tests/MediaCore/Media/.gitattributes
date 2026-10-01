@@ -1,2 +1,3 @@
-* binary
-*.py text eol=lf
+*.mp4 binary
+*.mkv binary
+*.webm binary
