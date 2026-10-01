@@ -33,6 +33,7 @@ set(KHUA_PORTABLE_HEADERS
     Core/Player/SPPlayerListener.hpp
     Core/Player/SPSync.hpp
     Core/Player/SPTasks.hpp
+    Core/Player/SPVideoDecoding.hpp
     Core/Player/SPVideoFrame.hpp
     Core/Recovery/RecoveryAsfRm.hpp
     Core/Recovery/RecoveryAvi.hpp
@@ -94,6 +95,7 @@ add_executable(khua_mediacore_tests
     AudioEngineTests.cpp
     AudioSinkTests.cpp
     ColorAndChannelTests.cpp
+    DecoderTests.cpp
     DemuxerTests.cpp
     ExecutorTests.cpp
     FFmpegConfigurationTests.cpp
@@ -112,6 +114,9 @@ target_link_libraries(khua_mediacore_tests
         khua_media_portable
         GTest::gtest_main
 )
+# Clips made by Media/make_test_media.py.
+target_compile_definitions(khua_mediacore_tests
+    PRIVATE KHUA_TEST_MEDIA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Media")
 add_dependencies(khua_mediacore_tests khua_header_check)
 
 gtest_discover_tests(khua_mediacore_tests DISCOVERY_MODE PRE_TEST)

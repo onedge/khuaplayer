@@ -36,6 +36,7 @@ add_library(khua_media_portable STATIC
     Output/SPD3D11Device.cpp
     Output/SPD3D11Renderer.cpp
     Output/SPOffscreenRenderTarget.cpp
+    Decode/SPFFmpegVideoDecoder.cpp
     ${KHUA_SHADER_DIR}/SPVideoVS.h
     ${KHUA_SHADER_DIR}/SPVideoPS.h
     Bridge/SPDoviRPU.cpp
@@ -48,6 +49,7 @@ target_include_directories(khua_media_portable
         ${CMAKE_CURRENT_SOURCE_DIR}/Core
         ${CMAKE_CURRENT_SOURCE_DIR}/Bridge
         ${CMAKE_CURRENT_SOURCE_DIR}/Output
+        ${CMAKE_CURRENT_SOURCE_DIR}/Decode
         ${FFMPEG_INCLUDE_DIRS}
     PRIVATE
         ${KHUA_SHADER_DIR}
@@ -60,9 +62,10 @@ target_link_libraries(khua_media_portable
         # WASAPI output: COM activation and MMCSS thread priority.
         ole32
         avrt
-        # Video output.
+        # Video output and D3D11VA decoding (dxguid: the decoder profile GUIDs).
         d3d11
         dxgi
+        dxguid
 )
 
 # Matches GCC_PREPROCESSOR_DEFINITIONS in Apps/Mac/project.yml.
